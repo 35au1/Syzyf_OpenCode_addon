@@ -1,0 +1,20 @@
+# Restored by `bun install` from package.json + bun.lock.
+node_modules/
+
+# Everything a run generates: definitions you have edited, handoff notes, transcripts.
+# These describe whatever job you pointed the loop at, so they are yours and not shareable by default.
+projectfiles/
+
+# Scratch space that never ships. Anything you do not want published goes here.
+_local/
+
+# Legacy locations from before runs were folder-scoped.
+dod-loop.log
+.opencode/dod-state.md
+
+# Credentials never belong in the repo; opencode keeps them in your user profile.
+.env
+.env.*
+*.pem
+*.key
+auth.json
