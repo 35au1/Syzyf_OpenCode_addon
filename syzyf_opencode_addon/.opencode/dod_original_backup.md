@@ -4,6 +4,8 @@ Access `C:\path\to\your\source-folder`. This is <what the source is> and it has 
 Write a <RECORD> library in `<artifact>.md` in this folder, keyed by <the key you group records by>,
 defining every value in every <RECORD>. The <source> has full documentation in that
 folder; use it. Be precise. Define what the <RECORD>s actually contain.
+Everything already known is in one text file at `C:\path\to\your\knowledge-base.txt`; read it first and
+treat it as the current knowledge base.
 Try to store information about <RECORD> in table/matrix way for easier comparison between <RECORD>s
 
 # 2. Definition of Done

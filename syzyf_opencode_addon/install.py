@@ -3,7 +3,7 @@
 
 Double-click on Windows, or run `python install.py`.
 
-The repo ships the loop itself: dod-loop.ts, run-dod-loop.bat, definition-gui.ps1, status.ps1, the
+The repo ships the loop itself: dod-loop.ts, start_syzyf.bat, definition-gui.ps1, status.ps1, the
 .opencode template and verifier agent, and package.json + bun.lock. It cannot ship these:
 
   1. Bun          - runs dod-loop.ts
@@ -42,7 +42,7 @@ OPENCODE_BIN = Path.home() / ".opencode" / "bin"
 # Files that must already be present. If one is missing the zip was extracted wrong.
 REQUIRED = [
     Path("dod-loop.ts"),
-    Path("run-dod-loop.bat"),
+    Path("start_syzyf.bat"),
     Path("definition-gui.ps1"),
     Path("package.json"),
     Path(".opencode/dod.md"),
@@ -69,7 +69,7 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
 
 def find_tool(name: str) -> Path | None:
     """PATH first, then the two install locations. A fresh shell often lacks ~/.bun/bin on PATH,
-    which is why run-dod-loop.bat prepends it, and why looking only at PATH reports false failures."""
+    which is why start_syzyf.bat prepends it, and why looking only at PATH reports false failures."""
     found = shutil.which(name)
     if found:
         return Path(found)
@@ -124,7 +124,7 @@ def ensure_bun(check_only: bool) -> Path | None:
 # ---------------------------------------------------------------------------- 2. opencode
 
 # The version this loop was checked against. Pinned so a new machine behaves like the old one; the
-# TUI-owns-the-server arrangement in run-dod-loop.bat depends on `opencode --port` behaviour.
+# TUI-owns-the-server arrangement in start_syzyf.bat depends on `opencode --port` behaviour.
 OPENCODE_PIN = "1.18.18"
 OPENCODE_PACKAGE = "opencode-ai"
 
@@ -166,7 +166,7 @@ def check_files() -> bool:
         return False
     record("folder contents", OK, f"all {len(REQUIRED)} required files present")
 
-    # Nothing is pre-created here. run-dod-loop.bat allocates projectfiles/<run id>/ at launch and
+    # Nothing is pre-created here. start_syzyf.bat allocates projectfiles/<run id>/ at launch and
     # seeds the definition from the template, so that the operator reviews it before work starts.
     runs = HERE / "projectfiles"
     existing = sorted(d.name for d in runs.iterdir() if d.is_dir() and RUN_ID.match(d.name)) if runs.is_dir() else []
@@ -286,7 +286,7 @@ def main() -> int:
         print()
         print("Next:")
         print("  1. Open a NEW terminal if Bun or opencode were just installed, so PATH updates.")
-        print("  2. Double-click run-dod-loop.bat")
+        print("  2. Double-click start_syzyf.bat")
         print()
         print("The TUI window it opens IS the server. Leave it open while the loop runs.")
         print("For an unattended run with no window to protect: set DOD_LOOP_NO_GUI=1 and watch")

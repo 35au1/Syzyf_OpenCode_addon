@@ -1,23 +1,34 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-rem run-dod-loop.bat - run the Definition of Done loop with a live view of it.
+rem start_syzyf.bat - run the Definition of Done loop with a live view of it.
 rem
-rem   run-dod-loop.bat                      allocate a new run, review the definition, launch
-rem   run-dod-loop.bat "your directive"     optional, overrides cycle 0's directive
-rem   set DOD_RUN_ID=00003                  resume an existing run instead of allocating a new one
-rem   set DOD_LOOP_NO_REVIEW=1              skip the review window and launch straight away
+rem   start_syzyf.bat                       pick a run in the window, then launch
+rem   start_syzyf.bat "your directive"      optional, overrides cycle 0's directive
+rem   set DOD_RUN_ID=00003                  preselect that run in the window
+rem   set DOD_LOOP_NO_REVIEW=1              skip the window entirely and launch straight away
 rem   set DOD_LOOP_TEXT_REVIEW=1            review in %EDITOR% instead of the window
 rem   set DOD_LOOP_NO_GUI=1                 headless: no TUI, monitor with status.ps1
 rem   set EDITOR=code -w                    editor for the text fallback (default: notepad)
 rem
-rem The review window is definition-gui.ps1: two editable boxes, "Task to perform" and "Definition of
-rem Done", saved back as the single file the verifier is handed. The split is presentation only.
+rem THE REVIEW WINDOW STAYS OPEN FOR THE WHOLE RUN
+rem
+rem definition-gui.ps1 does two jobs, which is why it is started in the background and never waited on:
+rem
+rem   1. It picks the run. Every folder under projectfiles\ is listed with where it stopped, so a run
+rem      that died mid-cycle is resumed by clicking it. It allocates a new run itself when you choose
+rem      "New run", so quitting never leaves an empty folder behind. The chosen id comes back through
+rem      the signal file below, because a window that stays open cannot answer with an exit code.
+rem
+rem   2. It keeps editing the definition while the loop runs. Saving rewrites the live run's
+rem      definition.md, and the loop re-reads that file at the start of every cycle, so a correction
+rem      lands on the next cycle. Closing the window does not stop the run.
 rem
 rem EVERY GENERATED FILE LIVES UNDER projectfiles\<run id>\
-rem   definition.md   the Definition of Done this run is judged against, seeded from .opencode\dod.md
-rem   state.md        the handoff notes carried between cycles
-rem   run.log         the full transcript
+rem   definition.md            the Definition of Done this run is judged against, seeded from .opencode\dod.md
+rem   definition.original.md   what the run was launched with, written once, never edited
+rem   state.md                 the handoff notes carried between cycles
+rem   run.log                  the full transcript
 rem A run id is five digits and iterates: 00001, 00002, ... Session titles use it too, so the TUI
 rem picker shows "00001 work 0" and "00001 verify 0".
 rem
@@ -44,9 +55,10 @@ rem
 rem ---------------------------------------------------------------------------------------------
 rem WHY THE TUI OWNS THE SERVER
 rem
-rem The opencode TUI has no attach-to-an-existing-server mode. It always spawns its own server in a
-rem worker (see cli/cmd/tui.ts), and even `--port` only tells THAT worker which port to bind. It
-rem never dials an external server and it never reads OPENCODE_BASE_URL.
+rem Started as `opencode --port N`, the TUI always spawns its own server in a worker (see
+rem cli/cmd/tui.ts), and even `--port` only tells THAT worker which port to bind. It never dials an
+rem external server and it never reads OPENCODE_BASE_URL. (There is a separate `opencode attach <url>`
+rem command, untested here, which may lift that restriction.)
 rem
 rem So the old arrangement - `opencode serve` for the loop, plus a separate `opencode` TUI - gave two
 rem processes with two event buses over one shared SQLite store. The TUI could read the loop's
@@ -57,7 +69,8 @@ rem Inverting it fixes that. `opencode --port N` makes the TUI's own worker bind
 rem API, and that worker forwards every GlobalBus event straight to the TUI. Point the loop at N and
 rem its sessions run inside that worker, so they stream live.
 rem
-rem The tradeoff: the TUI window IS the server. Closing it ends the run.
+rem The tradeoff: the TUI window IS the server. Closing it ends the run. The review window is the
+rem opposite - closing that one costs nothing but the ability to edit.
 rem ---------------------------------------------------------------------------------------------
 
 cd /d "%~dp0"
@@ -66,8 +79,29 @@ if "%PORT%"=="" set "PORT=4096"
 set "OPENCODE_BASE_URL=http://localhost:%PORT%"
 set "STARTED_SERVE="
 set "SERVER_PID="
+set "GUI_PID="
 set "LOOP_EXIT=1"
 if not defined EDITOR set "EDITOR=notepad"
+
+set "GUI_SCRIPT=%~dp0definition-gui.ps1"
+set "GUI_DIR=%CD%\projectfiles\_gui"
+set "SIGNAL=!GUI_DIR!\launch.txt"
+set "GUI_PIDFILE=!GUI_DIR!\gui.pid"
+set "GUI_BOUNDS="
+set "TUI_BOUNDS="
+
+rem ---------------------------------------------------------------- layout
+rem A starting arrangement for the two windows that matter: Syzyf down the left edge at full height, the
+rem TUI filling everything to its right. Both are drawn by different processes, so the split is computed
+rem once by layout.ps1 and handed to each of them. Drag them afterwards and they stay dragged.
+rem   set DOD_LOOP_NO_LAYOUT=1     leave every window wherever Windows puts it
+if defined DOD_LOOP_NO_LAYOUT goto :nolayout
+if not exist "%~dp0layout.ps1" goto :nolayout
+for /f "usebackq tokens=1,2 delims=|" %%A in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0layout.ps1" -Plan`) do (
+  set "GUI_BOUNDS=%%A"
+  set "TUI_BOUNDS=%%B"
+)
+:nolayout
 
 echo === Definition of Done loop ===
 echo project: %CD%
@@ -94,70 +128,98 @@ if not exist ".opencode\dod.md" (
   echo ERROR: .opencode\dod.md not found. That is the template definition; write your rules there first.
   goto :done
 )
-if not exist "definition-gui.ps1" (
+
+rem --------------------------------------------------------------- directive
+rem Optional. When empty, dod-loop.ts derives cycle 0's directive from the run's definition.
+set "DIRECTIVE=%~1"
+set "DIRECTIVE_SHOWN=!DIRECTIVE!"
+if not defined DIRECTIVE set "DIRECTIVE_SHOWN=(from definition.md)"
+
+rem ---------------------------------------------------------------- review
+rem Nothing starts until the operator has seen and approved what this run is aiming at. Getting the
+rem definition wrong is the expensive mistake here: the loop will chase a wrong rule for as many
+rem cycles as you give it, and every cycle costs a full context window.
+if defined DOD_LOOP_NO_REVIEW goto :allocate
+if defined DOD_LOOP_TEXT_REVIEW goto :allocate
+if not exist "!GUI_SCRIPT!" (
   echo NOTE: definition-gui.ps1 is missing, so the review step will use %EDITOR%.
+  goto :allocate
 )
 
-rem ------------------------------------------------------------------- run
-rem A new run unless DOD_RUN_ID names an existing one. --prepare creates the folder and copies the
-rem template in, so the definition exists on disk before anyone is asked to approve it.
+rem The window owns run selection AND stays open afterwards, so it is started in the background and
+rem answers through a file instead of an exit code.
+if not exist "!GUI_DIR!" mkdir "!GUI_DIR!" >nul 2>&1
+if exist "!SIGNAL!" del /q "!SIGNAL!" >nul 2>&1
+if exist "!GUI_PIDFILE!" del /q "!GUI_PIDFILE!" >nul 2>&1
+
+echo opening the review window: pick a run, edit it, then Save and launch.
+echo   It stays open for the whole run so you can correct the definition later.
+echo.
+
+rem Paths travel in environment variables and quotes are built with [char]34, so a project folder with
+rem a space in its name survives both the cmd and the PowerShell parse.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$q=[char]34; $a=@('-NoProfile','-Sta','-ExecutionPolicy','Bypass','-File',($q+$env:GUI_SCRIPT+$q),'-Signal',($q+$env:SIGNAL+$q)); if ($env:DOD_RUN_ID) { $a += @('-RunId',$env:DOD_RUN_ID) }; if ($env:GUI_BOUNDS) { $a += @('-Bounds',$env:GUI_BOUNDS) }; $p=Start-Process -FilePath 'powershell.exe' -ArgumentList $a -PassThru; Set-Content -LiteralPath $env:GUI_PIDFILE -Value $p.Id -Encoding ASCII"
+if not exist "!GUI_PIDFILE!" (
+  echo ERROR: could not start the review window. Set DOD_LOOP_TEXT_REVIEW=1 to review in %EDITOR% instead.
+  goto :done
+)
+set /p GUI_PID=<"!GUI_PIDFILE!"
+
+:waitgui
+if exist "!SIGNAL!" goto :readsignal
+rem The window normally writes "quit" on its way out. This catches the case where it died instead.
+tasklist /FI "PID eq !GUI_PID!" 2>nul | find "!GUI_PID!" >nul
+if errorlevel 1 (
+  echo.
+  echo the review window closed without launching anything.
+  set "LOOP_EXIT=0"
+  goto :done
+)
+timeout /t 1 /nobreak >nul 2>&1
+goto :waitgui
+
+:readsignal
+set "APPROVED="
+set /p APPROVED=<"!SIGNAL!"
+del /q "!SIGNAL!" >nul 2>&1
+if /i "!APPROVED!"=="quit" goto :cancelled
+if not defined APPROVED goto :cancelled
+set "DOD_RUN_ID=!APPROVED!"
+echo launching run !DOD_RUN_ID!
+goto :haverun
+
+rem ------------------------------------------------------------- allocation
+rem The text-review and no-review paths still allocate here, because only the window knows how to ask
+rem which run you meant.
+:allocate
 if defined DOD_RUN_ID goto :resume
 
 for /f "usebackq tokens=1-3 delims=|" %%A in (`bun dod-loop.ts --prepare`) do (
   set "DOD_RUN_ID=%%A"
-  set "RUN_DIR=%%B"
-  set "DEF_FILE=%%C"
 )
 if not defined DOD_RUN_ID (
   echo ERROR: could not allocate a run folder. See the error above.
   goto :done
 )
 echo allocated run !DOD_RUN_ID!
-goto :haverun
+goto :reviewtext
 
 :resume
-set "RUN_DIR=%CD%\projectfiles\%DOD_RUN_ID%"
+echo resuming run !DOD_RUN_ID!
+
+:reviewtext
+set "RUN_DIR=%CD%\projectfiles\!DOD_RUN_ID!"
 set "DEF_FILE=!RUN_DIR!\definition.md"
 if not exist "!DEF_FILE!" (
-  echo ERROR: run %DOD_RUN_ID% has no definition at !DEF_FILE!
+  echo ERROR: run !DOD_RUN_ID! has no definition at !DEF_FILE!
   echo Clear DOD_RUN_ID to allocate a fresh run.
   goto :done
 )
-echo resuming run !DOD_RUN_ID!
-
-:haverun
-echo files:   !RUN_DIR!
-echo.
-
-rem ------------------------------------------------------------- directive
-rem Optional. When empty, dod-loop.ts derives cycle 0's directive from the run's definition.
-set "DIRECTIVE=%~1"
-set "DIRECTIVE_SHOWN=!DIRECTIVE!"
-if not defined DIRECTIVE set "DIRECTIVE_SHOWN=(from definition.md)"
-
-if defined DOD_LOOP_NO_REVIEW goto :server
-
-rem ---------------------------------------------------------------- review
-rem Nothing starts until the operator has seen and approved what this run is aiming at. Getting the
-rem definition wrong is the expensive mistake here: the loop will chase a wrong rule for as many
-rem cycles as you give it, and every cycle costs a full context window.
-rem
-rem definition-gui.ps1 shows it as two editable boxes - the task, and the Definition of Done - and
-rem saves both back into the one file the verifier is given. Editing is the default state of that
-rem window: there is no mode to switch into and no menu to walk. Exit 0 launch, 1 quit, 2 no GUI here.
-:review
-if defined DOD_LOOP_TEXT_REVIEW goto :textreview
-if not exist "%~dp0definition-gui.ps1" goto :textreview
-
-powershell -NoProfile -Sta -ExecutionPolicy Bypass -File "%~dp0definition-gui.ps1" -Path "!DEF_FILE!" -RunId "!DOD_RUN_ID!"
-set "REVIEW=!ERRORLEVEL!"
-if "!REVIEW!"=="0" goto :approved
-if "!REVIEW!"=="1" goto :cancelled
-echo the review window could not open, using %EDITOR% instead
+if defined DOD_LOOP_NO_REVIEW goto :haverun
 
 rem Fallback for a machine without WinForms, or for DOD_LOOP_TEXT_REVIEW. Straight into the editor,
-rem no prompt first: nobody opens this to admire it.
-:textreview
+rem no prompt first: nobody opens this to admire it. This path cannot stay open during the run, so
+rem mid-run corrections need the window or a text editor of your own.
 echo editing the definition for run !DOD_RUN_ID! in %EDITOR%
 echo   !DEF_FILE!
 echo   Section 1 is the task, section 2 is the Definition of Done. Save and close to continue.
@@ -165,20 +227,28 @@ echo   Section 1 is the task, section 2 is the Definition of Done. Save and clos
 echo.
 choice /C LQ /N /M "[L]aunch   [Q]uit : "
 if errorlevel 2 goto :cancelled
-goto :approved
+goto :haverun
 
 :cancelled
 echo.
-echo cancelled. Run folder !RUN_DIR! is kept, resume it with:  set DOD_RUN_ID=!DOD_RUN_ID!
+echo cancelled. Nothing was launched.
+if defined DOD_RUN_ID echo Run folder projectfiles\!DOD_RUN_ID! is kept; pick it in the window to resume it.
 set "LOOP_EXIT=0"
 goto :done
 
-:approved
-echo.
+:haverun
+set "RUN_DIR=%CD%\projectfiles\!DOD_RUN_ID!"
+set "DEF_FILE=!RUN_DIR!\definition.md"
+if not exist "!DEF_FILE!" (
+  echo ERROR: run !DOD_RUN_ID! has no definition at !DEF_FILE!
+  goto :done
+)
 for %%S in ("!DEF_FILE!") do if %%~zS EQU 0 (
   echo ERROR: the definition is empty. Nothing to work towards.
   goto :done
 )
+echo files:   !RUN_DIR!
+echo.
 
 rem ---------------------------------------------------------------- server
 :server
@@ -189,7 +259,13 @@ if defined DOD_LOOP_NO_GUI goto :headless
 
 rem --- default: the TUI owns the server, so its event bus is the loop's event bus
 echo starting the opencode TUI, which owns the server on port %PORT% ...
-start "opencode TUI" cmd /k opencode --port %PORT%
+if defined TUI_BOUNDS (
+  rem layout.ps1 starts it and moves its window: a console window can only be placed through its handle,
+  rem and a process object is the only dependable way to get that handle.
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0layout.ps1" -StartTui -Rect "!TUI_BOUNDS!" -Port %PORT% -WorkDir "%CD%"
+) else (
+  start "opencode TUI" cmd /k opencode --port %PORT%
+)
 call :waitport
 if errorlevel 1 (
   echo ERROR: the TUI never started listening on port %PORT%.
@@ -230,12 +306,19 @@ echo.
 echo run:       !DOD_RUN_ID!
 echo directive: !DIRECTIVE_SHOWN!
 echo.
+rem This console is now just a transcript, and the same text goes to run.log, so it gets out of the way
+rem of the two windows that are worth looking at. Restore it from the taskbar whenever.
+if defined GUI_BOUNDS (
+  echo minimising this window: the run continues, and everything here is also in run.log
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0layout.ps1" -MinimizeParent >nul 2>&1
+)
 bun dod-loop.ts "!DIRECTIVE!"
 set "LOOP_EXIT=!ERRORLEVEL!"
 
 :stopserve
 rem Only ever stop a server this script started headlessly. The TUI's server belongs to the TUI, and
-rem killing it would take the user's window down with it.
+rem killing it would take the user's window down with it. The review window is left alone too: it is
+rem the operator's, and it is the fastest way to read what the run was aiming at.
 if not defined STARTED_SERVE goto :report
 if not defined SERVER_PID goto :report
 echo.
@@ -258,6 +341,9 @@ if defined RUN_DIR echo files:  !RUN_DIR!
 if not defined STARTED_SERVE if not defined DOD_LOOP_NO_GUI (
   echo.
   echo The TUI window is still open and still serving port %PORT%. Close it when you are done.
+)
+if defined GUI_PID (
+  echo The review window is still open. Close it whenever; it does not affect this result.
 )
 
 :done

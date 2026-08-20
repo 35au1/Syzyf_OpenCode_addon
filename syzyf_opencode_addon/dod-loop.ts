@@ -134,7 +134,7 @@ export function nextRunId(existing: string[]): string {
   return formatRunId(highest + 1)
 }
 
-export type RunPaths = { id: string; dir: string; rules: string; state: string; log: string }
+export type RunPaths = { id: string; dir: string; rules: string; original: string; state: string; log: string }
 
 /**
  * Where a run's files live. Names are unprefixed because the folder already carries the id; calling it
@@ -142,7 +142,14 @@ export type RunPaths = { id: string; dir: string; rules: string; state: string; 
  */
 export function runPaths(id: string): RunPaths {
   const dir = resolve(PROJECT_FILES, id)
-  return { id, dir, rules: resolve(dir, "definition.md"), state: resolve(dir, "state.md"), log: resolve(dir, "run.log") }
+  return {
+    id,
+    dir,
+    rules: resolve(dir, "definition.md"),
+    original: resolve(dir, "definition.original.md"),
+    state: resolve(dir, "state.md"),
+    log: resolve(dir, "run.log"),
+  }
 }
 
 /** Allocate the next run, create its folder, and seed the definition from the template. */
@@ -160,7 +167,7 @@ export function prepareRun(): RunPaths {
 /**
  * The run this process belongs to.
  *
- * Set by `run-dod-loop.bat` once it has allocated the folder and the operator has approved the
+ * Set by `start_syzyf.bat` once it has allocated the folder and the operator has approved the
  * definition. The placeholder keeps the module importable on its own; nothing is written under it,
  * because `loadRules` refuses to start without a real definition file.
  */
@@ -174,6 +181,14 @@ export const RULES_FILE = runPaths(RUN_ID).rules
  */
 export const STATE_FILE = runPaths(RUN_ID).state
 export const LOG_FILE = runPaths(RUN_ID).log
+/**
+ * What this run was launched with, written once and never again.
+ *
+ * The definition is editable while the run is going — that is the point of leaving the review window
+ * open — so after a few corrections there is nothing left to say what the run originally set out to
+ * do. This snapshot is that record, and it is what the review window shows for each run.
+ */
+export const ORIGINAL_RULES_FILE = runPaths(RUN_ID).original
 export const VERIFIER_AGENT = "dod-verifier"
 
 /**
@@ -269,11 +284,40 @@ export function die(message: string, detail?: unknown): never {
   process.exit(2)
 }
 
+/**
+ * The current definition, or undefined if there is not a usable one on disk right now.
+ *
+ * Non-fatal on purpose. The review window stays open for the whole run so the definition can be
+ * corrected mid-flight, which means the loop can read this file at the exact moment it is being
+ * rewritten. Killing a long run over a half-written file would be absurd, so the caller decides:
+ * startup treats it as fatal, and a running loop keeps the last good copy.
+ */
+export function readRules(): string | undefined {
+  try {
+    if (!existsSync(RULES_FILE)) return undefined
+    const text = readFileSync(RULES_FILE, "utf8")
+    return text.trim() ? text : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function loadRules(): string {
-  if (!existsSync(RULES_FILE)) die(`no Definition of Done file at ${RULES_FILE}`)
-  const text = readFileSync(RULES_FILE, "utf8")
-  if (!text.trim()) die(`Definition of Done file has no rules: ${RULES_FILE}`)
+  const text = readRules()
+  if (text === undefined) die(`no usable Definition of Done at ${RULES_FILE}`)
   return text
+}
+
+/**
+ * Record what this run started with, once. Never overwrites: after the first cycle this file is the
+ * only remaining evidence of the original job, and every later edit is deliberately not reflected here.
+ */
+export function snapshotOriginalRules(text: string): void {
+  try {
+    if (!existsSync(ORIGINAL_RULES_FILE)) writeFileSync(ORIGINAL_RULES_FILE, text, "utf8")
+  } catch {
+    // A missing snapshot costs a tooltip, not a run.
+  }
 }
 
 const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms))
@@ -776,7 +820,10 @@ export async function runLoop(input: {
   retryToleranceMs?: number
   /** Prefixes every session title, so the TUI's picker shows which run a session belongs to. Defaults to RUN_ID. */
   runId?: string
-  /** Called once per verify turn, so edits to the rules file during a run apply to the next verdict. */
+  /**
+   * Called once at the start of every cycle, so a definition corrected while the run is going takes
+   * effect from the next cycle. Must always return usable text; see the wrapper in main.
+   */
   rules: () => string
 }): Promise<LoopResult> {
   const needed = Math.max(1, Math.trunc(input.passStreak ?? PASS_STREAK) || 1)
@@ -798,8 +845,21 @@ export async function runLoop(input: {
   let streak = 0
   /** Consecutive cycles that could not reach the server at all. Three in a row ends the run. */
   let deadCycles = 0
+  /** The definition the previous cycle ran against, so an edit made mid-run is visible in the log. */
+  let previousRules: string | undefined
 
   for (let cycle = 0; cycle < input.budget; cycle++) {
+    // Read once per cycle, not once per turn: the work turn and the verify turn of the same cycle must
+    // be held to the same text, or a rule edited between them would be worked to one version and judged
+    // against another. A cycle boundary is also the only safe place to change the job, since a turn
+    // already in flight cannot be re-aimed.
+    const rules = input.rules()
+    if (previousRules !== undefined && rules !== previousRules)
+      log(
+        `cycle ${cycle}: definition changed since the last cycle (${previousRules.length} -> ${rules.length} chars), this cycle uses the new text`,
+      )
+    previousRules = rules
+
     // A fresh session per cycle is the whole point: context never accumulates across cycles, so work
     // can continue indefinitely through a bounded context window. Everything carried forward travels
     // through the repository on disk plus the directive, never through conversation memory.
@@ -859,7 +919,7 @@ export async function runLoop(input: {
       sessionID: verifier.id,
       models: input.verifyModels ?? VERIFY_MODELS,
       agent: VERIFIER_AGENT,
-      text: verifyPrompt(input.rules(), cycle),
+      text: verifyPrompt(rules, cycle),
       pollMs: input.turnPollMs,
       deadlineMs: input.turnDeadlineMs,
       retryToleranceMs: input.retryToleranceMs,
@@ -917,17 +977,34 @@ if (import.meta.main) {
   }
 
   if (!process.env.DOD_RUN_ID?.trim())
-    die("DOD_RUN_ID is not set. Launch with run-dod-loop.bat, which allocates the run folder and lets you review the definition first.")
+    die("DOD_RUN_ID is not set. Launch with start_syzyf.bat, which allocates the run folder and lets you review the definition first.")
   mkdirSync(RUN_DIR, { recursive: true })
 
   const initial = process.argv[2]?.trim() || startingDirective()
-  loadRules() // fail before creating anything if the rules are missing or empty
+  // Fail before creating anything if the rules are missing or empty.
+  let lastGoodRules = loadRules()
+  // Record what this run set out to do, but only on its very first launch: no log means no cycle has
+  // ever run, so the definition on disk is still the original one. Resuming a run that already has a
+  // log must not claim a definition edited three cycles ago was what it started with.
+  if (!existsSync(LOG_FILE)) snapshotOriginalRules(lastGoodRules)
+
   const result = await runLoop({
     client: createOpencodeClient({ baseUrl: BASE_URL }),
     initialDirective: initial,
     budget: CYCLE_BUDGET,
     passStreak: PASS_STREAK,
-    rules: loadRules,
+    // The review window stays open for the whole run, so this file can be mid-write when a cycle
+    // starts. Falling back to the last good copy keeps the run alive through a save; the next cycle
+    // picks up the finished edit a few minutes later.
+    rules: () => {
+      const text = readRules()
+      if (text !== undefined) {
+        lastGoodRules = text
+        return text
+      }
+      log(`WARNING no usable definition at ${RULES_FILE} right now, reusing the copy from the last cycle`)
+      return lastGoodRules
+    },
   })
   process.exit(result.reason === "pass" ? 0 : 1)
 }
