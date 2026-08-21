@@ -55,6 +55,13 @@ param(
   # Open straight into live mode for -RunId, skipping the approval gate. For reattaching to a run that
   # is already going, when the window it was launched from is gone.
   [switch]$Live,
+  # Start the loop ourselves on approval, instead of reporting back to a launcher.
+  #
+  # This is how a second, third, fourth run is added. The launcher exists to cold-start the TUI that
+  # serves the API; once that is up there is nothing left for it to do, so running it again just to add a
+  # run drags in a console, a layout pass and a redundant port check. With this, adding a run is one
+  # window and one bun process.
+  [switch]$SelfLaunch,
   # Where to put this window on first show, as "x,y,width,height". The launcher passes the left-hand
   # column from layout.ps1 so the TUI can have the rest of the screen. Dragging afterwards sticks;
   # nothing re-applies it.
@@ -1007,6 +1014,26 @@ function New-RunFolder {
   return @{ Id = $parts[0]; Dir = $parts[1]; DefFile = $parts[2] }
 }
 
+# Start a loop for this run, detached from this window.
+#
+# The run id travels in the environment because that is the only channel dod-loop.ts reads it from, and
+# Start-Process cannot set a variable for just the child - hence set, start, put back.
+function Start-LoopProcess([string]$runId) {
+  $keptRunId = $env:DOD_RUN_ID
+  $keptBaseUrl = $env:OPENCODE_BASE_URL
+  try {
+    $env:DOD_RUN_ID = $runId
+    $env:OPENCODE_BASE_URL = $BaseUrl
+    # Minimised rather than hidden: the loop writes everything to run.log anyway, but a window that can
+    # be restored beats one that cannot when something goes wrong early.
+    $process = Start-Process -FilePath $Bun -ArgumentList 'dod-loop.ts' -WorkingDirectory $PSScriptRoot -WindowStyle Minimized -PassThru
+    return $process
+  } finally {
+    $env:DOD_RUN_ID = $keptRunId
+    $env:OPENCODE_BASE_URL = $keptBaseUrl
+  }
+}
+
 function Write-Signal([string]$id) {
   if (-not $Signal) { return }
   $dir = Split-Path -Parent $Signal
@@ -1135,6 +1162,26 @@ function Invoke-Save {
     Write-Sections $targetFile $taskBox.Text $dodBox.Text
   } catch {
     Show-Problem ("Could not save:" + [Environment]::NewLine + $_.Exception.Message) 'Save failed'
+    return
+  }
+
+  # Adding a run to a server that is already up: start the loop here and go live, with no launcher and no
+  # console of our own.
+  if ($SelfLaunch) {
+    $started = $null
+    try {
+      $started = Start-LoopProcess $targetId
+    } catch {
+      Show-Problem ("Could not start the loop:" + [Environment]::NewLine + $_.Exception.Message) 'Launch failed'
+      return
+    }
+    if (-not $started) {
+      Show-Problem ('Could not start "' + $Bun + ' dod-loop.ts". Is bun on PATH?') 'Launch failed'
+      return
+    }
+    $script:result = 0
+    Enter-LiveMode $targetId $targetFile
+    Set-Hint ('Run ' + $targetId + ' started, pid ' + $started.Id + '. It keeps going if you close this window.')
     return
   }
 
@@ -1410,16 +1457,28 @@ $allRuns.Add_CheckedChanged({
 # A second run is a second launcher: it allocates its own id, gets its own handshake file and its own
 # window, and attaches to the server this one already started.
 $newRun.Add_Click({
-    $launcher = Join-Path $PSScriptRoot 'start_syzyf.bat'
-    if (-not (Test-Path -LiteralPath $launcher)) {
-      Show-Problem ('Cannot find the launcher at ' + $launcher) 'No launcher'
-      return
-    }
+    # Another window of this same script, in -SelfLaunch mode. NOT the launcher: that only exists to
+    # cold-start the TUI, which is already running, so re-running it would open a console and a second
+    # layout pass to accomplish nothing.
+    $self = Join-Path $PSScriptRoot 'definition-gui.ps1'
+    $bounds = ''
     try {
-      Start-Process -FilePath $launcher -WorkingDirectory $PSScriptRoot | Out-Null
-      Set-Hint 'Started another launcher. Its own window will open for you to pick and approve that run.'
+      $planner = Join-Path $PSScriptRoot 'layout.ps1'
+      if (Test-Path -LiteralPath $planner) {
+        # Ask for a slot, so the new window cascades clear of this one instead of landing on top.
+        $plan = (& 'powershell.exe' '-NoProfile' '-ExecutionPolicy' 'Bypass' '-File' $planner '-Plan')
+        if ($plan) { $bounds = ("$plan").Split('|')[0] }
+      }
+    } catch {}
+
+    $quote = [char]34
+    $args = @('-NoProfile', '-Sta', '-ExecutionPolicy', 'Bypass', '-File', ($quote + $self + $quote), '-SelfLaunch', '-BaseUrl', $BaseUrl)
+    if ($bounds) { $args += @('-Bounds', $bounds) }
+    try {
+      Start-Process -FilePath 'powershell.exe' -ArgumentList $args -WorkingDirectory $PSScriptRoot | Out-Null
+      Set-Hint 'Opened a window for another run. Approve it there and it starts its own loop on this server.'
     } catch {
-      Show-Problem ("Could not start another run:" + [Environment]::NewLine + $_.Exception.Message) 'Launch failed'
+      Show-Problem ("Could not open another window:" + [Environment]::NewLine + $_.Exception.Message) 'Launch failed'
     }
   })
 
