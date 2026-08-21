@@ -1,4 +1,4 @@
-# definition-gui.ps1 - the control window for a run: pick one, edit it, launch it, keep editing it.
+﻿# definition-gui.ps1 - the control window for a run: pick one, edit it, launch it, keep editing it.
 #
 #   powershell -NoProfile -Sta -ExecutionPolicy Bypass -File .\definition-gui.ps1 -Signal <signal file>
 #
@@ -240,8 +240,8 @@ $script:entries = @(Get-Entries)
 # tooltip can actually render. The full text is one button away.
 $script:tipCache = @{}
 function Get-TipText([int]$index) {
-  # Live, the rows are sessions rather than runs. The id is what status.ps1 and the TUI both speak.
-  if ($script:liveId) {
+  # In session mode the rows are sessions rather than runs. The id is what status.ps1 and the TUI speak.
+  if ($script:sessionMode) {
     if ($index -lt 0 -or $index -ge $script:sessionRows.Count) { return '' }
     $row = $script:sessionRows[$index]
     return 'session ' + $row.Id + "`r`n" + 'Click to show it in the TUI.'
@@ -630,7 +630,18 @@ $Logo = ($LogoRows | ForEach-Object {
 $script:result = 1
 # The run this window is currently editing, and whether the loop has been launched against it. Once
 # live, saving writes straight into the running job and the window stops being a gate.
-$script:liveId = ''
+# One window, many runs.
+#
+#   activeId     the run whose definition is in the boxes and whose sessions are listed
+#   launched     every run this window has started or attached to; a bookmark each
+#   sessionMode  the list has stopped being a run picker and become a session list
+#
+# Switching bookmarks re-points all three: the boxes, the save target, and the session filter.
+$script:activeId = ''
+$script:launched = @{}
+$script:bookmarks = @()
+$script:sessionMode = $false
+$script:tabSignature = ''
 $script:currentIndex = -1
 $script:currentFile = ''
 $script:loadedTask = ''
@@ -679,15 +690,17 @@ $grid = New-Object System.Windows.Forms.TableLayoutPanel
 $grid.Dock = 'Fill'
 $grid.BackColor = $Bg
 $grid.ColumnCount = 1
-$grid.RowCount = 9
+$grid.RowCount = 10
 $grid.Padding = New-Object System.Windows.Forms.Padding(14, 12, 14, 12)
-# header, runs label, runs list, task label, task box, dod label, dod box, hint, buttons
+# header, bookmarks, runs label, runs list, task label, task box, dod label, dod box, hint, buttons
 #
 # The hint gets a row of its own rather than a cell beside the buttons. Docked to the left column the
 # window is only ~614px wide, and a label sharing that row squeezed the buttons until "Save and launch"
 # ran off the edge.
 $rowPlan = @(
   @{ Kind = 'AutoSize'; Size = 0 },
+  # One bookmark per run this window knows. Hidden until a run exists.
+  @{ Kind = 'Absolute'; Size = 30 },
   # Fixed, not AutoSize: this row holds a table, and leaving it to size itself is what collapsed it.
   # 32 rather than 28, because the New run button measures 30 tall and would otherwise be clipped.
   @{ Kind = 'Absolute'; Size = 32 },
@@ -708,6 +721,17 @@ foreach ($plan in $rowPlan) {
 }
 $form.Controls.Add($grid)
 
+# ---------------------------------------------------------------------------------------- bookmarks
+# One button per run this window knows. Clicking one re-points the boxes, the save target and the session
+# filter at that run, which is why several runs need one window rather than one window each.
+$tabs = New-Object System.Windows.Forms.FlowLayoutPanel
+$tabs.Dock = 'Fill'
+$tabs.BackColor = $Bg
+$tabs.WrapContents = $false
+$tabs.AutoScroll = $true
+$tabs.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 4)
+$tabs.Visible = $false
+$grid.Controls.Add($tabs, 0, 1)
 # -------------------------------------------------------------------------------------------- header
 $header = New-Object System.Windows.Forms.Panel
 $header.BackColor = $Panel
@@ -853,7 +877,7 @@ $newRun.Anchor = 'None'
 $newRun.Margin = New-Object System.Windows.Forms.Padding(6, 0, 0, 0)
 $runHeader.Controls.Add($newRun, 2, 0)
 
-$grid.Controls.Add($runHeader, 0, 1)
+$grid.Controls.Add($runHeader, 0, 2)
 
 $runFrame = New-Object System.Windows.Forms.Panel
 $runFrame.Dock = 'Fill'
@@ -869,17 +893,17 @@ $runList.ForeColor = $Fg
 $runList.Font = $mono
 $runList.IntegralHeight = $false
 $runFrame.Controls.Add($runList)
-$grid.Controls.Add($runFrame, 0, 2)
+$grid.Controls.Add($runFrame, 0, 3)
 
 $task = New-Box ''
 $dod = New-Box ''
 $taskBox = $task.Box
 $dodBox = $dod.Box
 
-$grid.Controls.Add((New-Label '1. Task to perform' 8), 0, 3)
-$grid.Controls.Add($task.Frame, 0, 4)
-$grid.Controls.Add((New-Label '2. Definition of Done' 12), 0, 5)
-$grid.Controls.Add($dod.Frame, 0, 6)
+$grid.Controls.Add((New-Label '1. Task to perform' 8), 0, 4)
+$grid.Controls.Add($task.Frame, 0, 5)
+$grid.Controls.Add((New-Label '2. Definition of Done' 12), 0, 6)
+$grid.Controls.Add($dod.Frame, 0, 7)
 
 # ------------------------------------------------------------------------------------------- buttons
 $buttons = New-Object System.Windows.Forms.TableLayoutPanel
@@ -905,7 +929,7 @@ $hint.TextAlign = 'TopLeft'
 $hint.Margin = New-Object System.Windows.Forms.Padding(0, 8, 0, 0)
 # Wraps instead of widening the window, and leaves the button row the full width to itself.
 $hint.MaximumSize = New-Object System.Drawing.Size(560, 0)
-$grid.Controls.Add($hint, 0, 7)
+$grid.Controls.Add($hint, 0, 8)
 
 function Set-ButtonStyle($button, $back) {
   $button.AutoSize = $true
@@ -945,7 +969,7 @@ $launch.Font = $bold
 $launch.ForeColor = [System.Drawing.Color]::White
 $buttons.Controls.Add($launch, 5, 0)
 
-$grid.Controls.Add($buttons, 0, 8)
+$grid.Controls.Add($buttons, 0, 9)
 
 # ---------------------------------------------------------------------------------------- behaviour
 
@@ -1043,13 +1067,87 @@ function Write-Signal([string]$id) {
   [System.IO.File]::WriteAllText($Signal, $id + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
 }
 
-# After this the window is no longer a gate, it is the run's control panel: the launch button becomes a
-# plain save, and the run picker becomes a live session list you can click to steer the TUI.
-function Enter-LiveMode([string]$id, [string]$file) {
-  $script:liveId = $id
+function Test-RunLive([string]$id) {
+  if (-not $id) { return $false }
+  return [bool](Get-RunHeartbeat (Join-Path $Root $id))
+}
+
+function Test-ActiveLaunched {
+  return ($script:activeId -and $script:launched.ContainsKey($script:activeId))
+}
+
+# One bookmark per run this window knows, newest last, the active one highlighted and a star for any that
+# is actually running. Rebuilt only when something changed, because the session timer calls this every
+# two seconds and rebuilding buttons under the mouse is unpleasant.
+function Update-Bookmarks {
+  $ids = @($script:bookmarks)
+  if ($ids.Count -eq 0) { return }
+  $marks = ''
+  foreach ($id in $ids) { if (Test-RunLive $id) { $marks += 'L' } else { $marks += '-' } }
+  $signature = ($ids -join ',') + '|' + $script:activeId + '|' + $marks
+  if ($signature -eq $script:tabSignature) { return }
+  $script:tabSignature = $signature
+
+  $tabs.Controls.Clear()
+  foreach ($id in $ids) {
+    $tab = New-Object System.Windows.Forms.Button
+    $label = $id
+    if (Test-RunLive $id) { $label = $id + ' *' }
+    elseif (-not $script:launched.ContainsKey($id)) { $label = $id + ' ?' }
+    $tab.Text = $label
+    $tab.AutoSize = $true
+    $tab.FlatStyle = 'Flat'
+    $tab.Font = $small
+    $tab.FlatAppearance.BorderSize = 0
+    $tab.Padding = New-Object System.Windows.Forms.Padding(8, 2, 8, 2)
+    $tab.Margin = New-Object System.Windows.Forms.Padding(0, 0, 4, 0)
+    if ($id -eq $script:activeId) {
+      $tab.BackColor = $BtnGo
+      $tab.ForeColor = [System.Drawing.Color]::White
+    } else {
+      $tab.BackColor = $BtnFace
+      $tab.ForeColor = $Fg
+    }
+    $tab.Tag = $id
+    $tab.Add_Click({ param($sender, $e) Set-ActiveRun ([string]$sender.Tag) })
+    $tabs.Controls.Add($tab)
+  }
+  $tabs.Visible = $true
+}
+
+# Chrome that depends on which run is showing and whether it has been launched yet.
+function Update-RunChrome {
+  if (-not $script:activeId) { return }
+  $isLaunched = Test-ActiveLaunched
+  if ($isLaunched) {
+    $form.Text = 'Syzyf - run ' + $script:activeId
+    $launch.Text = 'Save'
+    $quit.Text = 'Close window'
+    $runLabel.ForeColor = $LiveColor
+    # Esc must not throw away a window being used to steer running jobs.
+    $form.CancelButton = $null
+  } else {
+    $form.Text = 'Syzyf - run ' + $script:activeId + ' (not started)'
+    $launch.Text = 'Save && launch'
+    $runLabel.ForeColor = $Heading
+  }
+}
+
+# Switch the window to another run: its definition into the boxes, its sessions into the list, its file as
+# the save target. This is what bookmarks are for, and why a second run needs no second window.
+function Set-ActiveRun([string]$id) {
+  if (-not $id) { return }
+  if ($id -eq $script:activeId) { return }
+  if (Test-Dirty) {
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+      ('Discard the unsaved edits to run ' + $script:activeId + '?'), 'Unsaved edits', 'YesNo', 'Warning')
+    if ($answer -ne 'Yes') { return }
+  }
+
+  $dir = Join-Path $Root $id
+  $file = Join-Path $dir 'definition.md'
+  $script:activeId = $id
   $script:currentFile = $file
-  # The run list is about to be replaced by sessions, so remember what is being edited before it goes.
-  $dir = Split-Path -Parent $file
   $script:activeEntry = @{
     Kind     = 'run'
     Id       = $id
@@ -1057,16 +1155,29 @@ function Enter-LiveMode([string]$id, [string]$file) {
     DefFile  = $file
     OrigFile = Join-Path $dir 'definition.original.md'
   }
-  $form.Text = 'Syzyf - run ' + $id + ' (live)'
-  $runLabel.ForeColor = $LiveColor
-  $launch.Text = 'Save'
-  $quit.Text = 'Close window'
-  # Esc must not throw away a window the operator is using to steer a running job.
-  $form.CancelButton = $null
+  $parsed = Read-Sections $file
+  $taskBox.Text = ConvertTo-CrLf $parsed.Task
+  $dodBox.Text = ConvertTo-CrLf $parsed.Dod
   Set-Baseline
-  Set-Hint 'Saved edits apply from the next cycle. Closing this window does not stop the run.'
-
+  Update-RunChrome
+  $script:tabSignature = ''
+  Update-Bookmarks
   $script:listSignature = ''
+  if ($script:sessionMode) { Update-Sessions }
+  if (Test-ActiveLaunched) {
+    Set-Hint 'Saved edits apply from the next cycle. Closing this window does not stop any run.'
+  } else {
+    Set-Hint 'This run has not started yet. Save and launch starts its loop.'
+  }
+}
+
+# A run has been launched, by us or by the launcher. Bookmark it and show it.
+function Register-Run([string]$id, [string]$file) {
+  if (-not $script:launched.ContainsKey($id)) { $script:launched[$id] = $true }
+  if (@($script:bookmarks) -notcontains $id) { $script:bookmarks = @($script:bookmarks) + $id }
+  $script:sessionMode = $true
+  $script:activeId = ''
+  Set-ActiveRun $id
   $runList.Items.Clear()
   # The launcher starts this window before the TUI, so the first refreshes are expected to fail until
   # the server is up. The timer keeps trying and the label says which state it is in.
@@ -1075,10 +1186,10 @@ function Enter-LiveMode([string]$id, [string]$file) {
 }
 
 function Update-Sessions {
-  if (-not $script:liveId) { return }
+  if (-not $script:sessionMode) { return }
   $everyRun = $allRuns.Checked
-  $rows = Get-SessionRows $script:liveId $everyRun
-  $scope = 'run ' + $script:liveId
+  $rows = Get-SessionRows $script:activeId $everyRun
+  $scope = 'run ' + $script:activeId
   if ($everyRun) { $scope = 'every run' }
 
   if ($null -eq $rows) {
@@ -1130,8 +1241,8 @@ function Invoke-Save {
     return
   }
 
-  # Live: the run already exists and the loop is reading this file every cycle.
-  if ($script:liveId) {
+  # Already launched: the loop is reading this file every cycle, so this is a plain save.
+  if (Test-ActiveLaunched) {
     try {
       Write-Sections $script:currentFile $taskBox.Text $dodBox.Text
     } catch {
@@ -1167,7 +1278,9 @@ function Invoke-Save {
 
   # Adding a run to a server that is already up: start the loop here and go live, with no launcher and no
   # console of our own.
-  if ($SelfLaunch) {
+  # Self-launch when asked, and always once this window has launched something: the server is up, so a
+  # launcher would add nothing but a console.
+  if ($SelfLaunch -or $script:launched.Count -gt 0) {
     $started = $null
     try {
       $started = Start-LoopProcess $targetId
@@ -1180,7 +1293,7 @@ function Invoke-Save {
       return
     }
     $script:result = 0
-    Enter-LiveMode $targetId $targetFile
+    Register-Run $targetId $targetFile
     Set-Hint ('Run ' + $targetId + ' started, pid ' + $started.Id + '. It keeps going if you close this window.')
     return
   }
@@ -1188,7 +1301,7 @@ function Invoke-Save {
   Write-Signal $targetId
   $script:result = 0
   # Without a signal file the caller is waiting on the exit code, so there is nothing to stay open for.
-  if ($Signal) { Enter-LiveMode $targetId $targetFile } else { $form.Close() }
+  if ($Signal) { Register-Run $targetId $targetFile } else { $form.Close() }
 }
 
 # One checkable, reorderable chain. Ticked items form the chain, and the order of the rows IS the order
@@ -1444,49 +1557,44 @@ function Show-Original {
 
 $sessionTimer = New-Object System.Windows.Forms.Timer
 $sessionTimer.Interval = 2000
-$sessionTimer.Add_Tick({ Update-Sessions })
+$sessionTimer.Add_Tick({ Update-Sessions; Update-Bookmarks })
 
 # Rebuild at once rather than waiting for the next tick, and clear the signature so the wider list is
 # actually redrawn instead of being mistaken for unchanged.
 $allRuns.Add_CheckedChanged({
-    if (-not $script:liveId) { return }
+    if (-not $script:sessionMode) { return }
     $script:listSignature = ''
     Update-Sessions
   })
 
 # A second run is a second launcher: it allocates its own id, gets its own handshake file and its own
 # window, and attaches to the server this one already started.
+# Add a run to THIS window: allocate the folder, bookmark it, and show it. No second window, no
+# launcher. It is not started until you approve it, so the button says Save and launch again.
 $newRun.Add_Click({
-    # Another window of this same script, in -SelfLaunch mode. NOT the launcher: that only exists to
-    # cold-start the TUI, which is already running, so re-running it would open a console and a second
-    # layout pass to accomplish nothing.
-    $self = Join-Path $PSScriptRoot 'definition-gui.ps1'
-    $bounds = ''
-    try {
-      $planner = Join-Path $PSScriptRoot 'layout.ps1'
-      if (Test-Path -LiteralPath $planner) {
-        # Ask for a slot, so the new window cascades clear of this one instead of landing on top.
-        $plan = (& 'powershell.exe' '-NoProfile' '-ExecutionPolicy' 'Bypass' '-File' $planner '-Plan')
-        if ($plan) { $bounds = ("$plan").Split('|')[0] }
-      }
-    } catch {}
-
-    $quote = [char]34
-    $args = @('-NoProfile', '-Sta', '-ExecutionPolicy', 'Bypass', '-File', ($quote + $self + $quote), '-SelfLaunch', '-BaseUrl', $BaseUrl)
-    if ($bounds) { $args += @('-Bounds', $bounds) }
-    try {
-      Start-Process -FilePath 'powershell.exe' -ArgumentList $args -WorkingDirectory $PSScriptRoot | Out-Null
-      Set-Hint 'Opened a window for another run. Approve it there and it starts its own loop on this server.'
-    } catch {
-      Show-Problem ("Could not open another window:" + [Environment]::NewLine + $_.Exception.Message) 'Launch failed'
+    if (Test-Dirty) {
+      $answer = [System.Windows.Forms.MessageBox]::Show(
+        'Discard the unsaved edits to the run you are looking at?', 'Unsaved edits', 'YesNo', 'Warning')
+      if ($answer -ne 'Yes') { return }
+      Set-Baseline
     }
+    $made = New-RunFolder
+    if ($made.Error) {
+      Show-Problem $made.Error 'Could not allocate a run'
+      return
+    }
+    if (@($script:bookmarks) -notcontains $made.Id) { $script:bookmarks = @($script:bookmarks) + $made.Id }
+    Set-ActiveRun $made.Id
+    $script:tabSignature = ''
+    Update-Bookmarks
+    Set-Hint ('Run ' + $made.Id + ' created from the template. Edit it, then Save and launch.')
   })
 
 # Jumping is bound to a real mouse click, not to SelectedIndexChanged: the refresh reselects a row
 # every time the list is rebuilt, and that must never fire a navigation.
 $runList.Add_MouseClick({
     param($sender, $e)
-    if (-not $script:liveId) { return }
+    if (-not $script:sessionMode) { return }
     $index = $sender.IndexFromPoint($e.Location)
     if ($index -lt 0 -or $index -ge $script:sessionRows.Count) { return }
     Select-TuiSession $script:sessionRows[$index]
@@ -1494,8 +1602,8 @@ $runList.Add_MouseClick({
 
 $runList.Add_SelectedIndexChanged({
     if ($script:suppressSelect) { return }
-    # Live: the list is sessions, and picking one is handled by the click above.
-    if ($script:liveId) { return }
+    # Session mode: the list is sessions, and picking one is handled by the click above.
+    if ($script:sessionMode) { return }
     $index = $runList.SelectedIndex
     if ($index -eq $script:currentIndex) { return }
     if (Test-Dirty) {
@@ -1534,7 +1642,7 @@ $original.Add_Click({ Show-Original })
 $models.Add_Click({ Show-ModelPicker })
 
 $reload.Add_Click({
-    if ((Test-Dirty) -and -not $script:liveId) {
+    if ((Test-Dirty) -and -not (Test-ActiveLaunched)) {
       $answer = [System.Windows.Forms.MessageBox]::Show(
         'Discard your unsaved edits and reload this definition from disk?',
         'Reload', 'YesNo', 'Warning')
@@ -1553,7 +1661,7 @@ $reload.Add_Click({
   })
 
 $quit.Add_Click({
-    if (-not $script:liveId) { $script:result = 1 }
+    if ($script:launched.Count -eq 0) { $script:result = 1 }
     $form.Close()
   })
 
@@ -1561,7 +1669,7 @@ $quit.Add_Click({
 # the only thing actually at risk, so that is the only thing worth asking about.
 $form.Add_FormClosing({
     param($sender, $e)
-    if ($script:liveId -and (Test-Dirty)) {
+    if ($script:launched.Count -gt 0 -and (Test-Dirty)) {
       $answer = [System.Windows.Forms.MessageBox]::Show(
         'You have unsaved edits to the live definition. Close anyway? The run keeps going either way.',
         'Unsaved edits', 'YesNo', 'Warning')
@@ -1569,7 +1677,7 @@ $form.Add_FormClosing({
     }
     # Closing before launching is an answer too, and the caller is watching the signal file for it.
     # Saying so explicitly turns its "did the window die?" poll into a one-second exit.
-    if (-not $e.Cancel -and -not $script:liveId -and $script:result -ne 0) { Write-Signal 'quit' }
+    if (-not $e.Cancel -and $script:launched.Count -eq 0 -and $script:result -ne 0) { Write-Signal 'quit' }
     if (-not $e.Cancel) { $sessionTimer.Stop() }
   })
 
@@ -1617,7 +1725,7 @@ if ($Live) {
     [System.Windows.Forms.MessageBox]::Show('-Live needs -RunId, so it knows which run to attach to.', 'Nothing to attach to', 'OK', 'Warning') | Out-Null
     exit 1
   }
-  Enter-LiveMode $RunId (Join-Path (Join-Path $Root $RunId) 'definition.md')
+  Register-Run $RunId (Join-Path (Join-Path $Root $RunId) 'definition.md')
 }
 
 [void]$form.ShowDialog()

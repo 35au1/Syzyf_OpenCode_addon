@@ -303,9 +303,24 @@ consistent because all the processes involved are equally DPI-unaware.
 
 ## Several runs at once
 
-Run `start_syzyf.bat` again and you get a second run alongside the first. Nothing needs configuring: each
-run writes only inside its own `projectfiles/<id>/`, and the second launcher finds the port already in use
-and attaches to the server the first one started rather than opening a rival TUI.
+Press **New run** in the review window. It allocates a run, bookmarks it, and shows it — in the same
+window. Edit the definition, press `Save & launch`, and that run starts its own loop against the server
+already running. No second launcher, no second TUI, no extra console.
+
+Bookmarks run along the top, one per run the window knows, the active one highlighted:
+
+```
+[ 00007 * ] [ 00008 * ] [ 00009 ? ]
+```
+
+`*` means a loop is alive for it, `?` means it exists but has not been started. Clicking a bookmark
+re-points everything at that run: its definition into the boxes, its file as the save target, its
+sessions into the list. That is the whole reason several runs need one window rather than one each.
+
+The launcher is still how you start from nothing, because something has to bring up the TUI that serves
+the API. Once that is up it has no further part to play, which is why `New run` does not use it.
+
+Each run writes only inside its own `projectfiles/<id>/`, so nothing is shared but the server.
 
 The review window's run list marks which are alive:
 
