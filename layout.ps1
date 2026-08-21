@@ -99,6 +99,21 @@ $SW_SHOWMINNOACTIVE = 7
 
 # ---------------------------------------------------------------------------------------------- plan
 
+# How many Syzyf windows are already on screen.
+#
+# Each concurrent run gets its own review window, and without this they would stack exactly on top of
+# each other: same plan in, same rectangle out. Counting them turns the second launch into a cascade.
+function Get-SyzyfWindowCount {
+  $count = 0
+  foreach ($handle in (Get-WindowHandles)) {
+    $window = [System.IntPtr]([int64]$handle)
+    if (-not [SyzyfLayout.Api]::IsWindowVisible($window)) { continue }
+    $info = Get-WindowInfo $window
+    if ($info.Title -like 'Syzyf*') { $count++ }
+  }
+  return $count
+}
+
 function Get-LayoutPlan {
   # WorkingArea, not Bounds: it excludes the taskbar, so "full height" means full USABLE height.
   # Primary screen only. A run spread over two monitors is a preference, not a default.
@@ -112,8 +127,23 @@ function Get-LayoutPlan {
   # A narrow screen: never leave the TUI less than half, since that is where the work is read.
   if ($width -gt [int]($area.Width / 2)) { $width = [int]($area.Width / 2) }
 
+  # Cascade, so a second concurrent run is visible rather than hidden under the first. Only the review
+  # window shifts: the TUI slot is shared, because the second launcher attaches to the server the first
+  # one started instead of opening another.
+  $slot = Get-SyzyfWindowCount
+  $shift = $slot * 34
+  $guiX = $area.X + $shift
+  $guiY = $area.Y + $shift
+  $guiHeight = $area.Height - $shift
+  # Past a handful of windows, start again at the top rather than walking off the screen.
+  if ($guiHeight -lt 620 -or ($guiX + $width) -gt $area.Right) {
+    $guiX = $area.X
+    $guiY = $area.Y
+    $guiHeight = $area.Height
+  }
+
   return @{
-    Gui = ('{0},{1},{2},{3}' -f $area.X, $area.Y, $width, $area.Height)
+    Gui = ('{0},{1},{2},{3}' -f $guiX, $guiY, $width, $guiHeight)
     Tui = ('{0},{1},{2},{3}' -f ($area.X + $width), $area.Y, ($area.Width - $width), $area.Height)
   }
 }

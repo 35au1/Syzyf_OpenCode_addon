@@ -5,7 +5,7 @@
 // met, or the job is not done. There is no partial credit and no score. While the answer is "not
 // done", the loop opens a fresh session and continues.
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { resolve } from "node:path"
 
 export const BASE_URL = process.env.OPENCODE_BASE_URL ?? "http://localhost:4096"
@@ -271,7 +271,15 @@ export function nextRunId(existing: string[]): string {
   return formatRunId(highest + 1)
 }
 
-export type RunPaths = { id: string; dir: string; rules: string; original: string; state: string; log: string }
+export type RunPaths = {
+  id: string
+  dir: string
+  rules: string
+  original: string
+  state: string
+  log: string
+  heartbeat: string
+}
 
 /**
  * Where a run's files live. Names are unprefixed because the folder already carries the id; calling it
@@ -286,19 +294,63 @@ export function runPaths(id: string): RunPaths {
     original: resolve(dir, "definition.original.md"),
     state: resolve(dir, "state.md"),
     log: resolve(dir, "run.log"),
+    heartbeat: resolve(dir, "heartbeat.json"),
   }
 }
 
-/** Allocate the next run, create its folder, and seed the definition from the template. */
+/**
+ * Allocate the next run, create its folder, and seed the definition from the template.
+ *
+ * The id is claimed by creating the folder WITHOUT `recursive`, which throws if it already exists. That
+ * is the whole point: two launchers started a moment apart both compute the same "highest + 1", and a
+ * recursive mkdir would hand them the same folder. Two loops then share one state.md and one run.log and
+ * quietly corrupt each other's run. Whoever loses the race takes the next number instead.
+ */
 export function prepareRun(): RunPaths {
   if (!existsSync(TEMPLATE_RULES_FILE)) die(`no template Definition of Done at ${TEMPLATE_RULES_FILE}`)
   const template = readFileSync(TEMPLATE_RULES_FILE, "utf8")
   if (!template.trim()) die(`template Definition of Done has no rules: ${TEMPLATE_RULES_FILE}`)
-  const paths = runPaths(nextRunId(listRunIds()))
-  mkdirSync(paths.dir, { recursive: true })
-  // Never overwrite: re-preparing an id must not discard corrections already made to it.
-  if (!existsSync(paths.rules)) writeFileSync(paths.rules, template, "utf8")
-  return paths
+  mkdirSync(PROJECT_FILES, { recursive: true })
+
+  let candidate = Number(nextRunId(listRunIds()))
+  for (let attempt = 0; attempt < 100; attempt++, candidate++) {
+    const paths = runPaths(formatRunId(candidate))
+    try {
+      mkdirSync(paths.dir)
+    } catch {
+      continue
+    }
+    writeFileSync(paths.rules, template, "utf8")
+    return paths
+  }
+  die("could not claim a run id: 100 consecutive folders already exist")
+}
+
+/**
+ * Proof that a loop is alive, for the review window's run list.
+ *
+ * The pid is the useful part. Freshness alone cannot answer the question, because a run parked in the
+ * quota cooldown legitimately writes nothing for fifteen minutes, while a crashed run leaves a file that
+ * looks recent for as long as you care to believe it. Asking the operating system whether that process
+ * still exists is exact.
+ */
+export function touchHeartbeat(cycle: number, phase: string): void {
+  try {
+    writeFileSync(
+      runPaths(RUN_ID).heartbeat,
+      JSON.stringify({ pid: process.pid, updated: Date.now(), cycle, phase }),
+      "utf8",
+    )
+  } catch {
+    // A missing heartbeat costs a marker in a list, not a run.
+  }
+}
+
+/** Remove the heartbeat on a clean exit, so a finished run stops claiming to be live. */
+export function clearHeartbeat(): void {
+  try {
+    rmSync(runPaths(RUN_ID).heartbeat, { force: true })
+  } catch {}
 }
 
 /**
@@ -417,6 +469,11 @@ export function die(message: string, detail?: unknown): never {
   console.error(message + detailText)
   try {
     appendFileSync(LOG_FILE, "ERROR " + message + detailText + "\n")
+  } catch {}
+  // Stop claiming to be live on the way out. A hard kill cannot do this, which is why the reader checks
+  // whether the recorded pid still exists rather than trusting the file's presence.
+  try {
+    rmSync(runPaths(RUN_ID).heartbeat, { force: true })
   } catch {}
   process.exit(2)
 }
@@ -625,6 +682,9 @@ async function attemptTurn(input: {
     const started = Date.now()
     while (!finished) {
       await sleep(input.pollMs)
+      // Every few seconds for as long as a turn runs, which is what makes the review window's LIVE
+      // marker trustworthy rather than a guess based on file timestamps.
+      touchHeartbeat(-1, modelName(input.model))
       if (finished) break
 
       const retry = await sessionRetry(input.client, input.sessionID)
@@ -990,6 +1050,7 @@ export async function runLoop(input: {
     // be held to the same text, or a rule edited between them would be worked to one version and judged
     // against another. A cycle boundary is also the only safe place to change the job, since a turn
     // already in flight cannot be re-aimed.
+    touchHeartbeat(cycle, "cycle start")
     const rules = input.rules()
     if (previousRules !== undefined && rules !== previousRules)
       log(
@@ -1175,5 +1236,6 @@ if (import.meta.main) {
       return lastGoodRules
     },
   })
+  clearHeartbeat()
   process.exit(result.reason === "pass" ? 0 : 1)
 }

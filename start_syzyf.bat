@@ -83,10 +83,15 @@ set "GUI_PID="
 set "LOOP_EXIT=1"
 if not defined EDITOR set "EDITOR=notepad"
 
+rem Several runs at once is a supported way to work, so nothing here may be a fixed shared filename.
+rem Two launchers with one signal file fight over it: the first window's answer gets deleted, or the
+rem second launcher reads the first window's run id and launches somebody else's run. A per-launch token
+rem keeps each handshake private.
 set "GUI_SCRIPT=%~dp0definition-gui.ps1"
 set "GUI_DIR=%CD%\projectfiles\_gui"
-set "SIGNAL=!GUI_DIR!\launch.txt"
-set "GUI_PIDFILE=!GUI_DIR!\gui.pid"
+set "TOKEN=%RANDOM%%RANDOM%"
+set "SIGNAL=!GUI_DIR!\launch-!TOKEN!.txt"
+set "GUI_PIDFILE=!GUI_DIR!\gui-!TOKEN!.pid"
 set "GUI_BOUNDS="
 set "TUI_BOUNDS="
 

@@ -301,6 +301,52 @@ the window cannot be found, it says so and carries on: the run matters more than
 Only the primary monitor is used, and the taskbar is excluded. Under display scaling everything stays
 consistent because all the processes involved are equally DPI-unaware.
 
+## Several runs at once
+
+Run `start_syzyf.bat` again and you get a second run alongside the first. Nothing needs configuring: each
+run writes only inside its own `projectfiles/<id>/`, and the second launcher finds the port already in use
+and attaches to the server the first one started rather than opening a rival TUI.
+
+The review window's run list marks which are alive:
+
+```
+     New run   (seeded from .opencode\dod.md)
+LIVE 00008   cycle 3 opencode/nemotron-3-ultra-free
+LIVE 00007   cycle 11 opencode/big-pickle
+     00006   cycle 18  passed 1/3  8m ago
+```
+
+`LIVE` comes from `heartbeat.json`, which records the loop's process id and is refreshed every few seconds
+while a turn is in flight. The marker asks the operating system whether that process still exists, rather
+than trusting the file's timestamp — a run parked in the fifteen minute quota cooldown writes nothing and
+is still alive, and a killed run leaves a file behind that looks recent for as long as you care to believe
+it. A clean exit deletes the file; a hard kill cannot, which is exactly why the pid is the thing checked.
+
+Tick **all runs** above the session list and it widens from this run's sessions to every run's, so one
+window drives them all:
+
+```
+00008 work 3         RUNNING      4s ago
+00007 verify 11      idle         40s ago
+00008 verify 2       idle         3m ago
+```
+
+Clicking any row still points the single TUI at that session, so jumping between concurrent runs is the
+same one click as jumping within one.
+
+Each new review window cascades 34px down and right, because otherwise the second would sit exactly on top
+of the first — same plan in, same rectangle out. The TUI slot is not offset, since there is only ever one.
+
+Two things worth deciding deliberately before starting a second run.
+
+**They share one free-model quota.** Two runs reach "Free usage exceeded" roughly twice as fast and then
+both sit in the cooldown, so two runs are not twice the throughput. Seven free models in the chain give
+useful headroom, but it is not free.
+
+**Nothing locks the repository.** Two work turns pointed at the same artifact will overwrite each other,
+and each verifier will judge a file the other is editing. Concurrent runs are safe when they target
+different source folders and different output artifacts, and actively harmful when they do not.
+
 ### Why the TUI owns the server
 
 Started as `opencode --port N`, the TUI always spawns its own server in a worker, and `--port` only
@@ -339,6 +385,7 @@ projectfiles/
     definition.original.md  what the run was launched with, written once and never edited
     state.md                handoff notes carried between cycles
     run.log                 the full transcript
+    heartbeat.json          proof this run's loop is alive, refreshed every few seconds
 ```
 
 `definition.original.md` is written at the first launch of a run and never again, which is what makes

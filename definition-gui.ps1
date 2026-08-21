@@ -135,6 +135,25 @@ function Write-Sections([string]$file, [string]$task, [string]$dod) {
 # An entry is one row in the picker. Index 0 is always the new-run row, so there is no separate button
 # for it and no mode to switch into.
 
+# Is a loop running for this run right now?
+#
+# The heartbeat records the loop's process id and dod-loop.ts refreshes it every few seconds while a turn
+# is in flight. Asking Windows whether that process still exists is the exact answer, and it survives the
+# two cases a timestamp cannot: a run parked in the fifteen minute quota cooldown writes nothing and is
+# still alive, while a killed run leaves a file behind and is not.
+function Get-RunHeartbeat([string]$dir) {
+  $file = Join-Path $dir 'heartbeat.json'
+  if (-not (Test-Path -LiteralPath $file)) { return $null }
+  try {
+    $beat = (Get-Content -LiteralPath $file -Raw | ConvertFrom-Json)
+    if (-not $beat.pid) { return $null }
+    if (-not (Get-Process -Id ([int]$beat.pid) -ErrorAction SilentlyContinue)) { return $null }
+    return $beat
+  } catch {
+    return $null
+  }
+}
+
 function Get-RunSummary([string]$dir) {
   $log = Join-Path $dir 'run.log'
   if (-not (Test-Path -LiteralPath $log)) { return 'prepared, never launched' }
@@ -174,7 +193,7 @@ function Get-Entries {
     Dir     = ''
     DefFile = $Template
     OrigFile = ''
-    Label   = 'New run   (seeded from .opencode\dod.md)'
+    Label   = '     New run   (seeded from .opencode\dod.md)'
   }
 
   if (Test-Path -LiteralPath $Root) {
@@ -183,13 +202,25 @@ function Get-Entries {
     foreach ($dir in $dirs) {
       $def = Join-Path $dir.FullName 'definition.md'
       if (-not (Test-Path -LiteralPath $def)) { continue }
+      $beat = Get-RunHeartbeat $dir.FullName
+      $mark = ''
+      $summary = Get-RunSummary $dir.FullName
+      if ($beat) {
+        $mark = 'LIVE'
+        # The log summary lags a running loop by a whole turn, so the heartbeat's own view is better.
+        $where = 'working'
+        if ($beat.cycle -ge 0) { $where = 'cycle ' + $beat.cycle }
+        if ($beat.phase) { $where = $where + ' ' + [string]$beat.phase }
+        $summary = $where
+      }
       $entries += @{
         Kind    = 'run'
         Id      = $dir.Name
         Dir     = $dir.FullName
         DefFile = $def
         OrigFile = Join-Path $dir.FullName 'definition.original.md'
-        Label   = 'Resume ' + $dir.Name + '   ' + (Get-RunSummary $dir.FullName)
+        Live    = [bool]$beat
+        Label   = ('{0,-5}{1}   {2}' -f $mark, $dir.Name, $summary)
       }
     }
   }
@@ -281,7 +312,7 @@ function ConvertTo-ItemList($value) {
 
 # $null means the server could not be reached, which is different from "no sessions yet": the window
 # opens before the TUI does, so the first few refreshes after launch are expected to fail.
-function Get-SessionRows([string]$runId) {
+function Get-SessionRows([string]$runId, [bool]$everyRun) {
   try {
     # Invoke-WebRequest plus an explicit parse, rather than Invoke-RestMethod, so the shape of what
     # comes back is ours to control.
@@ -306,8 +337,15 @@ function Get-SessionRows([string]$runId) {
     if ($null -eq $session) { continue }
     if ($session.id -isnot [string] -or $session.title -isnot [string]) { continue }
     $title = $session.title
-    if (-not $title.StartsWith($runId + ' ')) { continue }
-    $short = $title.Substring($runId.Length).Trim()
+    # Every run titles its sessions "<run id> work N", so one filter shows one run and the wider one
+    # shows every run at once - which is the point when several are going and you want to jump between.
+    if ($everyRun) {
+      if ($title -notmatch '^\d{5} ') { continue }
+      $short = $title
+    } else {
+      if (-not $title.StartsWith($runId + ' ')) { continue }
+      $short = $title.Substring($runId.Length).Trim()
+    }
     $age = Get-SessionAge $session
 
     $state = 'idle'
@@ -331,7 +369,7 @@ function Get-SessionRows([string]$runId) {
     $rows += @{
       Id    = [string]$session.id
       Short = $short
-      Label = ('{0,-11} {1,-12} {2}' -f $short, $state, $age.Text)
+      Label = ('{0,-18} {1,-12} {2}' -f $short, $state, $age.Text)
       Sort  = $age.Sort
     }
   }
@@ -757,8 +795,29 @@ function New-Box([string]$text) {
   return @{ Frame = $frame; Box = $box }
 }
 
+$runHeader = New-Object System.Windows.Forms.Panel
+$runHeader.Dock = 'Fill'
+$runHeader.BackColor = $Bg
+$runHeader.AutoSize = $true
+$runHeader.AutoSizeMode = 'GrowAndShrink'
+$runHeader.Margin = New-Object System.Windows.Forms.Padding(0)
+
 $runLabel = New-Label 'Run' 0
-$grid.Controls.Add($runLabel, 0, 1)
+$runLabel.Dock = 'Left'
+
+# Only meaningful once live, where it widens the session list from this run to every run that has any.
+# That is what makes several runs at once usable from one window.
+$allRuns = New-Object System.Windows.Forms.CheckBox
+$allRuns.Text = 'all runs'
+$allRuns.Font = $small
+$allRuns.ForeColor = $Muted
+$allRuns.BackColor = $Bg
+$allRuns.AutoSize = $true
+$allRuns.Dock = 'Right'
+
+$runHeader.Controls.Add($allRuns)
+$runHeader.Controls.Add($runLabel)
+$grid.Controls.Add($runHeader, 0, 1)
 
 $runFrame = New-Object System.Windows.Forms.Panel
 $runFrame.Dock = 'Fill'
@@ -961,17 +1020,20 @@ function Enter-LiveMode([string]$id, [string]$file) {
 
 function Update-Sessions {
   if (-not $script:liveId) { return }
-  $rows = Get-SessionRows $script:liveId
+  $everyRun = $allRuns.Checked
+  $rows = Get-SessionRows $script:liveId $everyRun
+  $scope = 'run ' + $script:liveId
+  if ($everyRun) { $scope = 'every run' }
 
   if ($null -eq $rows) {
-    $runLabel.Text = 'Sessions in run ' + $script:liveId + ' - waiting for the server on ' + $BaseUrl
+    $runLabel.Text = 'Sessions, ' + $scope + ' - waiting for the server on ' + $BaseUrl
     return
   }
   if ($rows.Count -eq 0) {
-    $runLabel.Text = 'Sessions in run ' + $script:liveId + ' - none yet, the first cycle is starting'
+    $runLabel.Text = 'Sessions, ' + $scope + ' - none yet, the first cycle is starting'
     return
   }
-  $runLabel.Text = 'Sessions in run ' + $script:liveId + ' - click one to show it in the TUI'
+  $runLabel.Text = 'Sessions, ' + $scope + ' - click one to show it in the TUI'
 
   # Rebuilding the list on every tick would fight the mouse and reset the scroll position, so it is
   # only rebuilt when something actually changed.
@@ -1306,6 +1368,14 @@ function Show-Original {
 $sessionTimer = New-Object System.Windows.Forms.Timer
 $sessionTimer.Interval = 2000
 $sessionTimer.Add_Tick({ Update-Sessions })
+
+# Rebuild at once rather than waiting for the next tick, and clear the signature so the wider list is
+# actually redrawn instead of being mistaken for unchanged.
+$allRuns.Add_CheckedChanged({
+    if (-not $script:liveId) { return }
+    $script:listSignature = ''
+    Update-Sessions
+  })
 
 # Jumping is bound to a real mouse click, not to SelectedIndexChanged: the refresh reselects a row
 # every time the list is rebuilt, and that must never fire a navigation.
