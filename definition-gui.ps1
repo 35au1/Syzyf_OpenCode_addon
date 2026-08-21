@@ -681,7 +681,9 @@ $grid.Padding = New-Object System.Windows.Forms.Padding(14, 12, 14, 12)
 # ran off the edge.
 $rowPlan = @(
   @{ Kind = 'AutoSize'; Size = 0 },
-  @{ Kind = 'AutoSize'; Size = 0 },
+  # Fixed, not AutoSize: this row holds a table, and leaving it to size itself is what collapsed it.
+  # 32 rather than 28, because the New run button measures 30 tall and would otherwise be clipped.
+  @{ Kind = 'Absolute'; Size = 32 },
   # Doubles as the live session list, where a long run has two rows per cycle, so it earns the height.
   @{ Kind = 'Absolute'; Size = 132 },
   @{ Kind = 'AutoSize'; Size = 0 },
@@ -795,15 +797,26 @@ function New-Box([string]$text) {
   return @{ Frame = $frame; Box = $box }
 }
 
-$runHeader = New-Object System.Windows.Forms.Panel
+# A table, not a Panel with docked children: an AutoSize Panel collapses to nothing around docked
+# children, which hid this whole row - label and all - the first time it was tried.
+$runHeader = New-Object System.Windows.Forms.TableLayoutPanel
 $runHeader.Dock = 'Fill'
 $runHeader.BackColor = $Bg
-$runHeader.AutoSize = $true
-$runHeader.AutoSizeMode = 'GrowAndShrink'
+$runHeader.ColumnCount = 3
+$runHeader.RowCount = 1
+$runHeader.Height = 32
 $runHeader.Margin = New-Object System.Windows.Forms.Padding(0)
+foreach ($width in @(100, 0, 0)) {
+  $style = New-Object System.Windows.Forms.ColumnStyle
+  if ($width -gt 0) { $style.SizeType = 'Percent'; $style.Width = $width } else { $style.SizeType = 'AutoSize' }
+  $runHeader.ColumnStyles.Add($style) | Out-Null
+}
 
 $runLabel = New-Label 'Run' 0
-$runLabel.Dock = 'Left'
+$runLabel.Dock = 'Fill'
+$runLabel.AutoSize = $false
+$runLabel.TextAlign = 'MiddleLeft'
+$runHeader.Controls.Add($runLabel, 0, 0)
 
 # Only meaningful once live, where it widens the session list from this run to every run that has any.
 # That is what makes several runs at once usable from one window.
@@ -813,10 +826,26 @@ $allRuns.Font = $small
 $allRuns.ForeColor = $Muted
 $allRuns.BackColor = $Bg
 $allRuns.AutoSize = $true
-$allRuns.Dock = 'Right'
+$allRuns.Anchor = 'None'
+$runHeader.Controls.Add($allRuns, 1, 0)
 
-$runHeader.Controls.Add($allRuns)
-$runHeader.Controls.Add($runLabel)
+# Starting another run means running the launcher again, so the window may as well do it. Each launcher
+# allocates its own run and its own handshake file, so this is simply a second independent run.
+# Styled inline rather than through Set-ButtonStyle: that helper is defined further down the file, and a
+# PowerShell function does not exist until its definition has been executed.
+$newRun = New-Object System.Windows.Forms.Button
+$newRun.Text = 'New run'
+$newRun.AutoSize = $true
+$newRun.FlatStyle = 'Flat'
+$newRun.BackColor = $BtnFace
+$newRun.ForeColor = $Fg
+$newRun.Font = $small
+$newRun.FlatAppearance.BorderSize = 0
+$newRun.Padding = New-Object System.Windows.Forms.Padding(6, 1, 6, 1)
+$newRun.Anchor = 'None'
+$newRun.Margin = New-Object System.Windows.Forms.Padding(6, 0, 0, 0)
+$runHeader.Controls.Add($newRun, 2, 0)
+
 $grid.Controls.Add($runHeader, 0, 1)
 
 $runFrame = New-Object System.Windows.Forms.Panel
@@ -1033,7 +1062,8 @@ function Update-Sessions {
     $runLabel.Text = 'Sessions, ' + $scope + ' - none yet, the first cycle is starting'
     return
   }
-  $runLabel.Text = 'Sessions, ' + $scope + ' - click one to show it in the TUI'
+  # Short, because this row now shares its width with the all-runs tick and the New run button.
+  $runLabel.Text = 'Sessions, ' + $scope
 
   # Rebuilding the list on every tick would fight the mouse and reset the scroll position, so it is
   # only rebuilt when something actually changed.
@@ -1375,6 +1405,22 @@ $allRuns.Add_CheckedChanged({
     if (-not $script:liveId) { return }
     $script:listSignature = ''
     Update-Sessions
+  })
+
+# A second run is a second launcher: it allocates its own id, gets its own handshake file and its own
+# window, and attaches to the server this one already started.
+$newRun.Add_Click({
+    $launcher = Join-Path $PSScriptRoot 'start_syzyf.bat'
+    if (-not (Test-Path -LiteralPath $launcher)) {
+      Show-Problem ('Cannot find the launcher at ' + $launcher) 'No launcher'
+      return
+    }
+    try {
+      Start-Process -FilePath $launcher -WorkingDirectory $PSScriptRoot | Out-Null
+      Set-Hint 'Started another launcher. Its own window will open for you to pick and approve that run.'
+    } catch {
+      Show-Problem ("Could not start another run:" + [Environment]::NewLine + $_.Exception.Message) 'Launch failed'
+    }
   })
 
 # Jumping is bound to a real mouse click, not to SelectedIndexChanged: the refresh reselects a row
