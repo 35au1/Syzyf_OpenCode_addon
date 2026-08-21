@@ -8,6 +8,11 @@ projectfiles/
 # Scratch space that never ships. Anything you do not want published goes here.
 _local/
 
+# What the server last said was available. Machine state, refreshed on every run, and only ever a cache
+# of an answer the server can give again. The chains chosen in the window (.opencode/models.json) DO
+# belong in the repo: they are a decision, not a cache.
+.opencode/models-cache.json
+
 # Legacy locations from before runs were folder-scoped.
 dod-loop.log
 .opencode/dod-state.md

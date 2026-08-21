@@ -29,30 +29,167 @@ export function parseModels(spec: string | undefined, fallback: string[]): Model
 }
 
 /**
+ * Where the chosen chains are stored, so the choice survives a reboot and the review window has
+ * somewhere to write it. Environment variables still win, for a one-off run.
+ */
+export const MODELS_FILE = resolve(process.cwd(), ".opencode/models.json")
+
+/**
+ * The catalogue as last seen from a running server, written on every run.
+ *
+ * The review window opens before any server exists, so without this it could only ever offer a text
+ * box. `opencode models` lists the ids without a server; this file is what turns those ids into names,
+ * context sizes and a trustworthy free/paid flag.
+ */
+export const MODELS_CACHE_FILE = resolve(process.cwd(), ".opencode/models-cache.json")
+
+export type ModelConfig = { work?: string[]; verify?: string[] }
+
+function toIdList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const ids = value.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "")
+  return ids.length > 0 ? ids : undefined
+}
+
+/** The chains chosen in the review window. Absent or unreadable means "no opinion", not "empty". */
+export function readModelConfig(): ModelConfig {
+  try {
+    if (!existsSync(MODELS_FILE)) return {}
+    const parsed = JSON.parse(readFileSync(MODELS_FILE, "utf8")) as ModelConfig
+    return { work: toIdList(parsed?.work), verify: toIdList(parsed?.verify) }
+  } catch {
+    return {}
+  }
+}
+
+const MODEL_CONFIG = readModelConfig()
+
+/**
+ * The last-resort chain, used only when nothing is configured and the server cannot be asked.
+ *
+ * Deliberately not a single model: Zen's free tier is not one shared budget, each free model is a
+ * separate upstream integration with its own capacity, so one reporting "Free usage exceeded" says
+ * nothing about the rest. That is what makes a chain worth more than a longer backoff.
+ *
+ * These ids rot. Free models come and go — `deepseek-v4-flash-free` was in this list until it
+ * disappeared — which is why `resolveChain` checks every id against the live catalogue and falls back
+ * to whatever is actually free rather than trusting this.
+ */
+export const FALLBACK_MODELS = ["big-pickle", "mimo-v2.5-free", "nemotron-3-ultra-free"]
+
+/**
  * The model chain, tried in order, moving on when one is out of quota.
  *
- * Zen's free tier is not one shared budget: each free model is a separate upstream integration with
- * its own capacity, so `deepseek-v4-flash-free` reporting "Free usage exceeded" says nothing about
- * the rest. That is what makes this chain worth having rather than just a longer backoff.
- *
- * `nemotron-3.5-lightning-free` is deliberately absent. The verify turn has to enumerate a source set
- * of hundreds of files before it may judge a rule, and a small fast model that gives up on the
- * enumeration and passes anyway is the single worst failure this design can suffer: three of those in
- * a row ends the run on an unfinished job. A stalled loop is recoverable, a false pass is not.
+ * Order matters for the verify turn in particular. It has to enumerate a source set of hundreds of
+ * files before it may judge a rule, and a small fast model that gives up on the enumeration and passes
+ * anyway is the single worst failure this design can suffer: three of those in a row ends the run on an
+ * unfinished job. A stalled loop is recoverable, a false pass is not. Prefer the largest context first.
  */
-export const WORK_MODELS = parseModels(process.env.DOD_WORK_MODELS, [
-  "deepseek-v4-flash-free",
-  "big-pickle",
-  "mimo-v2.5-free",
-])
-export const VERIFY_MODELS = parseModels(process.env.DOD_VERIFY_MODELS, [
-  "deepseek-v4-flash-free",
-  "big-pickle",
-  "mimo-v2.5-free",
-])
+export const WORK_MODELS = parseModels(process.env.DOD_WORK_MODELS ?? MODEL_CONFIG.work?.join(","), FALLBACK_MODELS)
+export const VERIFY_MODELS = parseModels(
+  process.env.DOD_VERIFY_MODELS ?? MODEL_CONFIG.verify?.join(","),
+  FALLBACK_MODELS,
+)
 
 /** The head of the work chain. Kept as a named export because it is the run's headline model. */
 export const MODEL = WORK_MODELS[0]
+
+export type ModelInfo = {
+  /** "provider/model", the form both the chain config and the logs use. */
+  id: string
+  providerID: string
+  modelID: string
+  name: string
+  free: boolean
+  /** No tool calling means no reading the repository, which makes a model useless to either turn. */
+  tools: boolean
+  context: number
+  status: string
+}
+
+/**
+ * Every model this account can actually reach, from the server's own provider config.
+ *
+ * `cost` is why this is worth a round trip: it states whether a model is free outright, so nothing has
+ * to be inferred from whether the id happens to end in "-free". `big-pickle` is free and does not say
+ * so in its name.
+ */
+export async function fetchModels(baseUrl: string = BASE_URL): Promise<ModelInfo[]> {
+  const response = await fetch(`${baseUrl}/config/providers`)
+  if (!response.ok) throw new Error(`GET /config/providers returned ${response.status}`)
+  const body = (await response.json()) as {
+    providers?: Array<{ id?: string; models?: Record<string, unknown> }>
+  }
+
+  const found: ModelInfo[] = []
+  for (const provider of body.providers ?? []) {
+    for (const [modelID, raw] of Object.entries(provider.models ?? {})) {
+      const model = raw as {
+        id?: string
+        providerID?: string
+        name?: string
+        status?: string
+        cost?: { input?: number; output?: number }
+        capabilities?: { toolcall?: boolean }
+        limit?: { context?: number }
+      }
+      const providerID = model.providerID ?? provider.id ?? "opencode"
+      const id = model.id ?? modelID
+      found.push({
+        id: `${providerID}/${id}`,
+        providerID,
+        modelID: id,
+        name: model.name ?? id,
+        // Missing cost is treated as paid on purpose: guessing wrong in that direction costs money.
+        free: model.cost?.input === 0 && model.cost?.output === 0,
+        tools: model.capabilities?.toolcall === true,
+        context: model.limit?.context ?? 0,
+        status: model.status ?? "unknown",
+      })
+    }
+  }
+  // Largest context first: that is the order that suits a verify turn enumerating a large source set.
+  return found.sort((left, right) => right.context - left.context)
+}
+
+/** Every free, tool-capable, active model, largest context first. */
+export function usableFreeModels(catalogue: ModelInfo[]): ModelInfo[] {
+  return catalogue.filter((model) => model.free && model.tools && model.status === "active")
+}
+
+export function writeModelCache(catalogue: ModelInfo[]): void {
+  try {
+    writeFileSync(MODELS_CACHE_FILE, JSON.stringify({ fetched: Date.now(), models: catalogue }, null, 2), "utf8")
+  } catch {
+    // A stale cache costs the review window some labels, not a run.
+  }
+}
+
+/**
+ * Drop chain entries the server no longer offers, and never start a run with an empty chain.
+ *
+ * Free models are withdrawn without notice. Left unchecked, a vanished id burns two failed attempts and
+ * a backoff on every turn of every cycle while looking like a quota problem.
+ */
+export function resolveChain(label: string, wanted: Model[], catalogue: ModelInfo[]): Model[] {
+  // No catalogue means the server could not be asked. Trust what was configured rather than overriding
+  // it from a position of ignorance.
+  if (catalogue.length === 0) return wanted
+
+  const available = new Set(catalogue.filter((model) => model.status === "active").map((model) => model.id))
+  const kept: Model[] = []
+  for (const model of wanted) {
+    const id = `${model.providerID}/${model.modelID}`
+    if (available.has(id)) kept.push(model)
+    else log(`${label}: ${id} is no longer available, dropped from the chain`)
+  }
+  if (kept.length > 0) return kept
+
+  const free = usableFreeModels(catalogue).map((model) => ({ providerID: model.providerID, modelID: model.modelID }))
+  if (free.length === 0) die(`${label}: nothing configured is available and the server offers no free model`)
+  log(`${label}: nothing configured is available, using every free model instead`)
+  return free
+}
 
 /**
  * How long to wait when every model in a chain is out of quota.
@@ -976,6 +1113,26 @@ if (import.meta.main) {
     process.exit(0)
   }
 
+  // `--models` asks a running server what this account can reach, refreshes the cache the review window
+  // reads, and prints one pipe-delimited line per model. Needs a server; the review window falls back to
+  // the cache when there is none.
+  if (process.argv[2] === "--models") {
+    try {
+      const catalogue = await fetchModels()
+      writeModelCache(catalogue)
+      for (const model of catalogue)
+        console.log(
+          [model.id, model.free ? "free" : "paid", model.tools ? "tools" : "notools", model.context, model.status, model.name].join(
+            "|",
+          ),
+        )
+      process.exit(0)
+    } catch (error) {
+      console.error(`could not reach ${BASE_URL}: ${describe(error)}`)
+      process.exit(1)
+    }
+  }
+
   if (!process.env.DOD_RUN_ID?.trim())
     die("DOD_RUN_ID is not set. Launch with start_syzyf.bat, which allocates the run folder and lets you review the definition first.")
   mkdirSync(RUN_DIR, { recursive: true })
@@ -988,11 +1145,23 @@ if (import.meta.main) {
   // log must not claim a definition edited three cycles ago was what it started with.
   if (!existsSync(LOG_FILE)) snapshotOriginalRules(lastGoodRules)
 
+  // Ask what is actually reachable before committing to a chain, and refresh the cache the review window
+  // reads while a server happens to be up.
+  let catalogue: ModelInfo[] = []
+  try {
+    catalogue = await fetchModels()
+    writeModelCache(catalogue)
+  } catch (error) {
+    log(`could not read the model catalogue, using the configured chains as they stand: ${describe(error)}`)
+  }
+
   const result = await runLoop({
     client: createOpencodeClient({ baseUrl: BASE_URL }),
     initialDirective: initial,
     budget: CYCLE_BUDGET,
     passStreak: PASS_STREAK,
+    workModels: resolveChain("work models", WORK_MODELS, catalogue),
+    verifyModels: resolveChain("verify models", VERIFY_MODELS, catalogue),
     // The review window stays open for the whole run, so this file can be mid-write when a cycle
     // starts. Falling back to the last good copy keeps the run alive through a save; the next cycle
     // picks up the finished edit a few minutes later.

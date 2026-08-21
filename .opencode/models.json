@@ -1,0 +1,12 @@
+{
+    "work":  [
+                 "opencode/x-preview-f-free",
+                 "opencode/mimo-v2.5-free",
+                 "opencode/muse-spark-1.2-contributor-free"
+             ],
+    "verify":  [
+                   "opencode/x-preview-f-free",
+                   "opencode/mimo-v2.5-free",
+                   "opencode/muse-spark-1.2-contributor-free"
+               ]
+}

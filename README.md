@@ -216,6 +216,24 @@ Only sessions titled for this run are listed, so the subagent sessions a work tu
 the way; they are still reachable through `ctrl+p` in the TUI. Under `DOD_LOOP_NO_GUI` there is no TUI
 to drive, so the list still populates but a click reports that nothing took the jump.
 
+**And it picks the models.** The `Models` button opens the two chains side by side — work and verify —
+listing everything the account can reach with its context size and free/paid flag. Tick what each turn
+may use and order it with `Up`/`Down`; the order is the order the loop tries them in.
+
+```
+free        1048576 ctx  opencode/muse-spark-1.2-contributor-free
+free        1000000 ctx  opencode/nemotron-3-ultra-free
+free         200000 ctx  opencode/big-pickle
+```
+
+The list is merged from two places, because neither is enough on its own. `opencode models` reports what
+is reachable right now and needs no server, which matters because this window opens before the server
+does. `.opencode/models-cache.json`, written by the loop whenever a server was up, supplies the names,
+context sizes and the free/paid flag — only a server knows the cost, and `big-pickle` is free without
+saying so in its name. A model in the CLI list but not the cache is still offered, marked `unknown`, so a
+newly added free model is never invisible. `Refresh from server` re-reads the catalogue when one is
+running.
+
 - Both boxes are editable from the moment it opens. `Ctrl+Enter` launches, then saves.
 - Saving always writes back the canonical `# 1. Task to perform` / `# 2. Definition of Done` headings,
   so an older single-section definition normalises itself the first time you open it here.
@@ -406,8 +424,12 @@ window of work. That is why the budget is unbounded by default.
 
 | Variable | Default |
 |---|---|
-| `DOD_WORK_MODELS` | `deepseek-v4-flash-free,big-pickle,mimo-v2.5-free` |
-| `DOD_VERIFY_MODELS` | `deepseek-v4-flash-free,big-pickle,mimo-v2.5-free` |
+| `DOD_WORK_MODELS` | from `.opencode/models.json`, else every free model |
+| `DOD_VERIFY_MODELS` | from `.opencode/models.json`, else every free model |
+
+**Pick these in the window rather than here.** The `Models` button lists every model the account can
+reach, with its context size and whether it is genuinely free, and writes the two chains to
+`.opencode/models.json`. The environment variables still win when set, for a one-off run.
 
 Comma-separated chains, tried in order. A bare id is assumed to be a Zen model, so `big-pickle` and
 `opencode/big-pickle` mean the same thing.
@@ -416,9 +438,27 @@ The chain is worth more than a longer backoff because Zen's free tier is not one
 free model is a separate upstream integration with its own capacity, so one model reporting "Free
 usage exceeded" says nothing about the rest.
 
-`nemotron-3.5-lightning-free` is deliberately absent from the defaults. A verify turn has to enumerate
-hundreds of source files before it may judge a rule, and a small fast model that gives up on the
-enumeration and passes anyway is exactly the failure this design exists to prevent.
+**Free models are withdrawn without notice.** `deepseek-v4-flash-free` was in the shipped defaults
+until it disappeared. So at startup the loop asks the server what exists, drops any configured model
+that has gone, and says so in the log:
+
+```
+work models: opencode/deepseek-v4-flash-free is no longer available, dropped from the chain
+```
+
+If nothing configured survives, it falls back to every free tool-capable model, largest context first,
+rather than failing. Left unchecked, a vanished id burns two failed attempts and a backoff on every turn
+of every cycle while looking exactly like a quota problem.
+
+Order matters most for the verify turn. It has to enumerate hundreds of source files before it may judge
+a rule, and a small fast model that gives up on the enumeration and passes anyway is exactly the failure
+this design exists to prevent — so put the big-context models first there.
+
+To see the catalogue from a terminal, with a server running:
+
+```
+bun dod-loop.ts --models
+```
 
 ### Quota and watchdog
 

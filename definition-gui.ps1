@@ -59,6 +59,9 @@ param(
   # column from layout.ps1 so the TUI can have the rest of the screen. Dragging afterwards sticks;
   # nothing re-applies it.
   [string]$Bounds = '',
+  # Print the model catalogue as the picker would build it, then exit. For checking the merge of
+  # "what is available" and "what the cache knows about it" without opening a window.
+  [switch]$ListModels,
   # Print how a definition splits, and what runs exist, then exit without opening a window.
   [switch]$SelfTest,
   # Rewrite one definition with the canonical headings and exit. Same save path the window uses.
@@ -340,7 +343,117 @@ function Get-SessionRows([string]$runId) {
   return $rows
 }
 
+# ---------------------------------------------------------------------------------------- models
+# Free models are withdrawn without notice - deepseek-v4-flash-free was a default until it vanished -
+# so the chains cannot be a hardcoded list. They are chosen here and written to .opencode/models.json,
+# which dod-loop.ts reads.
+#
+# The catalogue is merged from two sources, because neither alone is enough:
+#
+#   `opencode models`             every model this account can reach RIGHT NOW, and needs no server.
+#   .opencode/models-cache.json   name, context and the free/paid flag, written by the loop while a
+#                                 server was up. Only a server knows the cost, and this window opens
+#                                 before the server exists.
+#
+# A model present in the CLI list but missing from the cache is still offered, marked unknown: a brand
+# new free model should not be invisible just because no run has seen it yet.
+
+$ModelsConfigFile = Join-Path $PSScriptRoot '.opencode\models.json'
+$ModelsCacheFile = Join-Path $PSScriptRoot '.opencode\models-cache.json'
+
+function Get-AvailableModelIds {
+  $ids = @()
+  Push-Location -LiteralPath $PSScriptRoot
+  try {
+    $out = & 'opencode' 'models' 2>&1
+    if ($LASTEXITCODE -eq 0) {
+      foreach ($line in @($out)) {
+        $text = ("$line").Trim()
+        if ($text -and $text -notmatch '\s' -and $text.Contains('/')) { $ids += $text }
+      }
+    }
+  } catch {
+  } finally {
+    Pop-Location
+  }
+  return $ids
+}
+
+function Get-ModelCache {
+  $map = @{}
+  if (-not (Test-Path -LiteralPath $ModelsCacheFile)) { return $map }
+  try {
+    $parsed = (Get-Content -LiteralPath $ModelsCacheFile -Raw | ConvertFrom-Json)
+    foreach ($model in @($parsed.models)) {
+      if ($model.id) { $map[[string]$model.id] = $model }
+    }
+  } catch {}
+  return $map
+}
+
+function Get-ModelCatalogue {
+  $cache = Get-ModelCache
+  $ids = Get-AvailableModelIds
+  # No CLI answer (opencode missing, or not logged in) - fall back to whatever the cache remembers, so
+  # the picker still shows something useful.
+  if ($ids.Count -eq 0) { $ids = @($cache.Keys) }
+
+  $rows = @()
+  foreach ($id in $ids) {
+    $info = $null
+    if ($cache.ContainsKey($id)) { $info = $cache[$id] }
+    $free = 'unknown'
+    if ($info) { if ($info.free) { $free = 'free' } else { $free = 'PAID' } }
+    $context = 0
+    if ($info -and $info.context) { $context = [int]$info.context }
+    $name = $id
+    if ($info -and $info.name) { $name = [string]$info.name }
+    $rows += @{
+      Id      = $id
+      Name    = $name
+      Free    = $free
+      Context = $context
+      Label   = ('{0,-9} {1,9} ctx  {2}' -f $free, $context, $id)
+    }
+  }
+  # Largest context first, which is the order a verify turn enumerating a big source set wants.
+  return @($rows | Sort-Object -Property @{ Expression = { $_.Context }; Descending = $true })
+}
+
+function Read-ModelChains {
+  $chains = @{ Work = @(); Verify = @() }
+  if (-not (Test-Path -LiteralPath $ModelsConfigFile)) { return $chains }
+  try {
+    $parsed = (Get-Content -LiteralPath $ModelsConfigFile -Raw | ConvertFrom-Json)
+    if ($parsed.work) { $chains.Work = @($parsed.work | ForEach-Object { [string]$_ }) }
+    if ($parsed.verify) { $chains.Verify = @($parsed.verify | ForEach-Object { [string]$_ }) }
+  } catch {}
+  return $chains
+}
+
+function Write-ModelChains($work, $verify) {
+  $body = [ordered]@{ work = @($work); verify = @($verify) } | ConvertTo-Json -Depth 3
+  $dir = Split-Path -Parent $ModelsConfigFile
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  $encoding = New-Object System.Text.UTF8Encoding($false)
+  $temp = $ModelsConfigFile + '.saving'
+  [System.IO.File]::WriteAllText($temp, $body, $encoding)
+  Move-Item -LiteralPath $temp -Destination $ModelsConfigFile -Force
+}
+
 # ---------------------------------------------------------------------------------- non-window modes
+
+if ($ListModels) {
+  $catalogue = Get-ModelCatalogue
+  $chains = Read-ModelChains
+  Write-Output ('--- catalogue (' + $catalogue.Count + ' models) ---')
+  foreach ($row in $catalogue) { Write-Output ('  ' + $row.Label + '   "' + $row.Name + '"') }
+  Write-Output ('--- chains in ' + $ModelsConfigFile + ' ---')
+  Write-Output ('  work:   ' + (@($chains.Work) -join ', '))
+  Write-Output ('  verify: ' + (@($chains.Verify) -join ', '))
+  exit 0
+}
+
 
 if ($SelfTest -or $Normalize) {
   $target = $Path
@@ -521,9 +634,13 @@ $grid = New-Object System.Windows.Forms.TableLayoutPanel
 $grid.Dock = 'Fill'
 $grid.BackColor = $Bg
 $grid.ColumnCount = 1
-$grid.RowCount = 8
+$grid.RowCount = 9
 $grid.Padding = New-Object System.Windows.Forms.Padding(14, 12, 14, 12)
-# header, runs label, runs list, task label, task box, dod label, dod box, buttons
+# header, runs label, runs list, task label, task box, dod label, dod box, hint, buttons
+#
+# The hint gets a row of its own rather than a cell beside the buttons. Docked to the left column the
+# window is only ~614px wide, and a label sharing that row squeezed the buttons until "Save and launch"
+# ran off the edge.
 $rowPlan = @(
   @{ Kind = 'AutoSize'; Size = 0 },
   @{ Kind = 'AutoSize'; Size = 0 },
@@ -533,6 +650,7 @@ $rowPlan = @(
   @{ Kind = 'Percent'; Size = 34 },
   @{ Kind = 'AutoSize'; Size = 0 },
   @{ Kind = 'Percent'; Size = 66 },
+  @{ Kind = 'AutoSize'; Size = 0 },
   @{ Kind = 'AutoSize'; Size = 0 }
 )
 foreach ($plan in $rowPlan) {
@@ -673,23 +791,26 @@ $buttons = New-Object System.Windows.Forms.TableLayoutPanel
 $buttons.Dock = 'Fill'
 $buttons.AutoSize = $true
 $buttons.BackColor = $Bg
-$buttons.ColumnCount = 5
+$buttons.ColumnCount = 6
 $buttons.RowCount = 1
 $buttons.Margin = New-Object System.Windows.Forms.Padding(0, 10, 0, 0)
-foreach ($width in @(100, 0, 0, 0, 0)) {
+foreach ($width in @(100, 0, 0, 0, 0, 0)) {
   $style = New-Object System.Windows.Forms.ColumnStyle
   if ($width -gt 0) { $style.SizeType = 'Percent'; $style.Width = $width } else { $style.SizeType = 'AutoSize' }
   $buttons.ColumnStyles.Add($style) | Out-Null
 }
 
 $hint = New-Object System.Windows.Forms.Label
-$hint.AutoSize = $false
-$hint.Dock = 'Fill'
+$hint.AutoSize = $true
+$hint.Dock = 'Top'
 $hint.Font = $tiny
 $hint.ForeColor = $Muted
 $hint.BackColor = $Bg
-$hint.TextAlign = 'MiddleLeft'
-$buttons.Controls.Add($hint, 0, 0)
+$hint.TextAlign = 'TopLeft'
+$hint.Margin = New-Object System.Windows.Forms.Padding(0, 8, 0, 0)
+# Wraps instead of widening the window, and leaves the button row the full width to itself.
+$hint.MaximumSize = New-Object System.Drawing.Size(560, 0)
+$grid.Controls.Add($hint, 0, 7)
 
 function Set-ButtonStyle($button, $back) {
   $button.AutoSize = $true
@@ -697,33 +818,39 @@ function Set-ButtonStyle($button, $back) {
   $button.BackColor = $back
   $button.ForeColor = $Fg
   $button.FlatAppearance.BorderSize = 0
-  $button.Padding = New-Object System.Windows.Forms.Padding(14, 6, 14, 6)
-  $button.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
+  # Tight, because five buttons plus a highlighted one have to fit a 614px column without clipping.
+  $button.Padding = New-Object System.Windows.Forms.Padding(8, 5, 8, 5)
+  $button.Margin = New-Object System.Windows.Forms.Padding(5, 0, 0, 0)
 }
+
+$models = New-Object System.Windows.Forms.Button
+$models.Text = 'Models'
+Set-ButtonStyle $models $BtnFace
+$buttons.Controls.Add($models, 1, 0)
 
 $original = New-Object System.Windows.Forms.Button
 $original.Text = 'Original'
 Set-ButtonStyle $original $BtnFace
-$buttons.Controls.Add($original, 1, 0)
+$buttons.Controls.Add($original, 2, 0)
 
 $reload = New-Object System.Windows.Forms.Button
 $reload.Text = 'Reload'
 Set-ButtonStyle $reload $BtnFace
-$buttons.Controls.Add($reload, 2, 0)
+$buttons.Controls.Add($reload, 3, 0)
 
 $quit = New-Object System.Windows.Forms.Button
 $quit.Text = 'Quit'
 Set-ButtonStyle $quit $BtnFace
-$buttons.Controls.Add($quit, 3, 0)
+$buttons.Controls.Add($quit, 4, 0)
 
 $launch = New-Object System.Windows.Forms.Button
-$launch.Text = 'Save and launch'
+$launch.Text = 'Save && launch'
 Set-ButtonStyle $launch $BtnGo
 $launch.Font = $bold
 $launch.ForeColor = [System.Drawing.Color]::White
-$buttons.Controls.Add($launch, 4, 0)
+$buttons.Controls.Add($launch, 5, 0)
 
-$grid.Controls.Add($buttons, 0, 7)
+$grid.Controls.Add($buttons, 0, 8)
 
 # ---------------------------------------------------------------------------------------- behaviour
 
@@ -925,6 +1052,219 @@ function Invoke-Save {
   if ($Signal) { Enter-LiveMode $targetId $targetFile } else { $form.Close() }
 }
 
+# One checkable, reorderable chain. Ticked items form the chain, and the order of the rows IS the order
+# the loop tries them in, which is why Up and Down matter as much as the ticks.
+function New-ChainPanel([string]$title, $catalogue, $chosenIds) {
+  $panel = New-Object System.Windows.Forms.Panel
+  $panel.Dock = 'Fill'
+  $panel.BackColor = $Bg
+  $panel.Padding = New-Object System.Windows.Forms.Padding(0)
+
+  $label = New-Object System.Windows.Forms.Label
+  $label.Text = $title
+  $label.Font = $bold
+  $label.ForeColor = $Heading
+  $label.BackColor = $Bg
+  $label.Dock = 'Top'
+  $label.Height = 22
+  $panel.Controls.Add($label)
+
+  $bar = New-Object System.Windows.Forms.Panel
+  $bar.Dock = 'Bottom'
+  $bar.Height = 34
+  $bar.BackColor = $Bg
+
+  $list = New-Object System.Windows.Forms.CheckedListBox
+  $list.Dock = 'Fill'
+  $list.BorderStyle = 'FixedSingle'
+  $list.BackColor = $Field
+  $list.ForeColor = $Fg
+  $list.Font = $mono
+  $list.CheckOnClick = $true
+  $list.IntegralHeight = $false
+
+  # Chosen models first, in the order they were saved, then everything else. So the chain reads top-down
+  # and the unused models sit below it.
+  $rows = New-Object System.Collections.ArrayList
+  foreach ($id in @($chosenIds)) {
+    $match = @($catalogue | Where-Object { $_.Id -eq $id })
+    if ($match.Count -gt 0) { [void]$rows.Add($match[0]) }
+  }
+  foreach ($row in $catalogue) {
+    if (-not (@($rows | Where-Object { $_.Id -eq $row.Id }).Count)) { [void]$rows.Add($row) }
+  }
+  foreach ($row in $rows) {
+    $checked = (@($chosenIds) -contains $row.Id)
+    [void]$list.Items.Add($row.Label, $checked)
+  }
+  $list.Tag = $rows
+
+  $up = New-Object System.Windows.Forms.Button
+  $up.Text = 'Up'
+  Set-ButtonStyle $up $BtnFace
+  $up.Margin = New-Object System.Windows.Forms.Padding(0)
+  $up.Dock = 'Left'
+  $down = New-Object System.Windows.Forms.Button
+  $down.Text = 'Down'
+  Set-ButtonStyle $down $BtnFace
+  $down.Dock = 'Left'
+
+  # GetNewClosure, so each panel's buttons keep hold of their own list rather than the last one created.
+  $up.Add_Click({ Move-ChainItem $list -1 }.GetNewClosure())
+  $down.Add_Click({ Move-ChainItem $list 1 }.GetNewClosure())
+
+  $bar.Controls.Add($down)
+  $bar.Controls.Add($up)
+  $panel.Controls.Add($bar)
+  $panel.Controls.Add($list)
+  $list.BringToFront()
+  return @{ Panel = $panel; List = $list }
+}
+
+function Move-ChainItem($list, [int]$delta) {
+  $index = $list.SelectedIndex
+  if ($index -lt 0) { return }
+  $target = $index + $delta
+  if ($target -lt 0 -or $target -ge $list.Items.Count) { return }
+  $rows = $list.Tag
+  $wasChecked = $list.GetItemChecked($index)
+  $movedRow = $rows[$index]
+  $movedLabel = $list.Items[$index]
+  $rows.RemoveAt($index)
+  $list.Items.RemoveAt($index)
+  $rows.Insert($target, $movedRow)
+  $list.Items.Insert($target, $movedLabel)
+  $list.SetItemChecked($target, $wasChecked)
+  $list.SelectedIndex = $target
+}
+
+function Get-CheckedIds($list) {
+  $ids = @()
+  $rows = $list.Tag
+  for ($i = 0; $i -lt $list.Items.Count; $i++) {
+    if ($list.GetItemChecked($i)) { $ids += $rows[$i].Id }
+  }
+  return $ids
+}
+
+function Show-ModelPicker {
+  $catalogue = Get-ModelCatalogue
+  if ($catalogue.Count -eq 0) {
+    Show-Problem ("No models found. Check that opencode is on PATH and you are logged in:" + [Environment]::NewLine + "  opencode auth login") 'No models'
+    return
+  }
+  $chains = Read-ModelChains
+
+  $dialog = New-Object System.Windows.Forms.Form
+  $dialog.Text = 'Free models - work and verify chains'
+  $dialog.Size = New-Object System.Drawing.Size(880, 620)
+  $dialog.StartPosition = 'CenterParent'
+  $dialog.BackColor = $Bg
+  $dialog.ForeColor = $Fg
+  $dialog.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+  $blurbLabel = New-Object System.Windows.Forms.Label
+  $blurbLabel.Text = 'Tick the models each turn may use, in the order they should be tried. The loop moves to the next one when a model reports "Free usage exceeded", so more than one is worth having. A vanished model is dropped automatically at launch. Leave both empty to let the loop use every free model, largest context first.'
+  $blurbLabel.Font = $small
+  $blurbLabel.ForeColor = $Muted
+  $blurbLabel.BackColor = $Bg
+  $blurbLabel.Dock = 'Top'
+  $blurbLabel.Height = 62
+  $dialog.Controls.Add($blurbLabel)
+
+  $footer = New-Object System.Windows.Forms.Panel
+  $footer.Dock = 'Bottom'
+  $footer.Height = 44
+  $footer.BackColor = $Bg
+
+  $split = New-Object System.Windows.Forms.TableLayoutPanel
+  $split.Dock = 'Fill'
+  $split.BackColor = $Bg
+  $split.ColumnCount = 2
+  $split.RowCount = 1
+  foreach ($half in @(50, 50)) {
+    $style = New-Object System.Windows.Forms.ColumnStyle
+    $style.SizeType = 'Percent'
+    $style.Width = $half
+    $split.ColumnStyles.Add($style) | Out-Null
+  }
+
+  $workPanel = New-ChainPanel 'Work chain' $catalogue $chains.Work
+  $verifyPanel = New-ChainPanel 'Verify chain' $catalogue $chains.Verify
+  $split.Controls.Add($workPanel.Panel, 0, 0)
+  $split.Controls.Add($verifyPanel.Panel, 1, 0)
+
+  $refresh = New-Object System.Windows.Forms.Button
+  $refresh.Text = 'Refresh from server'
+  Set-ButtonStyle $refresh $BtnFace
+  $refresh.Dock = 'Left'
+  $refresh.Add_Click({
+      # Only a server knows the cost, so this is the one action here that needs one running.
+      Push-Location -LiteralPath $PSScriptRoot
+      $failed = $null
+      try {
+        $env:OPENCODE_BASE_URL = $BaseUrl
+        $out = & $Bun 'dod-loop.ts' '--models' 2>&1
+        if ($LASTEXITCODE -ne 0) { $failed = ($out | Out-String) }
+      } catch {
+        $failed = $_.Exception.Message
+      } finally {
+        Pop-Location
+      }
+      if ($failed) {
+        Show-Problem ("Could not refresh from " + $BaseUrl + ":" + [Environment]::NewLine + $failed.Trim() + [Environment]::NewLine + [Environment]::NewLine + "The list below still shows what opencode reports as available.") 'No server to ask'
+        return
+      }
+      $dialog.Tag = 'refresh'
+      $dialog.Close()
+    })
+
+  $cancel = New-Object System.Windows.Forms.Button
+  $cancel.Text = 'Cancel'
+  Set-ButtonStyle $cancel $BtnFace
+  $cancel.Dock = 'Right'
+
+  $save = New-Object System.Windows.Forms.Button
+  $save.Text = 'Save chains'
+  Set-ButtonStyle $save $BtnGo
+  $save.Font = $bold
+  $save.ForeColor = [System.Drawing.Color]::White
+  $save.Dock = 'Right'
+  $save.Add_Click({
+      $workIds = Get-CheckedIds $workPanel.List
+      $verifyIds = Get-CheckedIds $verifyPanel.List
+      try {
+        Write-ModelChains $workIds $verifyIds
+      } catch {
+        Show-Problem ("Could not save:" + [Environment]::NewLine + $_.Exception.Message) 'Save failed'
+        return
+      }
+      $dialog.Tag = 'saved'
+      $dialog.Close()
+    })
+
+  $footer.Controls.Add($refresh)
+  $footer.Controls.Add($cancel)
+  $footer.Controls.Add($save)
+  $dialog.Controls.Add($footer)
+  $dialog.Controls.Add($split)
+  $split.BringToFront()
+  $dialog.CancelButton = $cancel
+  $dialog.Add_Shown({ Set-DarkTitleBar $dialog.Handle })
+  [void]$dialog.ShowDialog($form)
+  $outcome = $dialog.Tag
+  $dialog.Dispose()
+
+  if ($outcome -eq 'saved') {
+    $saved = Read-ModelChains
+    $workCount = @($saved.Work).Count
+    $verifyCount = @($saved.Verify).Count
+    Set-Hint ('Saved model chains: work ' + $workCount + ', verify ' + $verifyCount + '. Applies to the next run launched.')
+  }
+  # Refresh rewrote the cache, so reopen with the fresher labels rather than making the operator click again.
+  if ($outcome -eq 'refresh') { Show-ModelPicker }
+}
+
 function Show-Original {
   $entry = $script:activeEntry
   if ($null -eq $entry) { return }
@@ -1016,6 +1356,7 @@ $runList.Add_MouseLeave({ $script:tipIndex = -2 })
 
 $launch.Add_Click({ Invoke-Save })
 $original.Add_Click({ Show-Original })
+$models.Add_Click({ Show-ModelPicker })
 
 $reload.Add_Click({
     if ((Test-Dirty) -and -not $script:liveId) {
